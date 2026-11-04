@@ -307,3 +307,33 @@ Operator notes:
 - `wwwdir/api.php` reads plural parameters: `stream_ids[]` and `servers[]`, not `stream_id`/`server_id`.
 - The ODIN blocker in `get.php` writes to an `odin_blocker` table that does not exist in
   `database.sql`, so it is inert (its INSERT fails silently). Unchanged.
+
+
+## 6. Full decoder audit (142 decoder-output files) and HTMLPurifier replacement
+
+All 142 files carrying the EasyToYou "Decoded file for php version" header (124 admin, 11 crons,
+7 tools) were audited with an independent review. Report: `.agents/tasks/decoder-audit.md`
+(not shipped in the zip).
+
+Fixed in admin/ (each line marked `// fixed:`):
+- `admin/stream.php`, `admin/radio.php`: on-demand server list was built from array keys
+  (0,1,..) instead of the posted server IDs, so on-demand settings were saved wrong.
+- `admin/bouquet_order.php`: movie and radio IDs were dropped when saving a bouquet order.
+- `admin/database.php`: dropped `break`s and misplaced `gzclose`/`fclose` in the SQL/.gz import
+  and the result-table renderer (infinite loop / truncated imports).
+
+Replaced `admin/HTMLPurifier.standalone.php` and `admin/standalone/` with the OFFICIAL
+HTMLPurifier 4.12.0 standalone build (same version, generated from the v4.12.0 tag with
+`maintenance/generate-standalone.php`). The decoded copy, even after patching, stripped text
+(`a & b < c` -> `a &amp; b `, `<b>bold</b>` -> `<b></b>`), let `<script></script>` through and
+raised PHP warnings; the panel's `XSS()` runs every form value through it. The official build
+reproduces the upstream reference output exactly on the test set and has no PHP 7.4-deprecated
+syntax. `install.py` now deletes stale `DefinitionCache/Serializer/*.ser` caches on install.
+
+Left unchanged (uncertain, listed in the audit report): `* 0` factors in bitrate/bandwidth maths
+in `crons/users_checker.php`, `crons/servers_checker.php`, `crons/vod_checker.php`,
+`crons/vod_cc_checker.php` (likely dropped constants; the original value is unknown), and a few
+cosmetic empty branches.
+
+Out of scope: the 33 goto-obfuscated files under `wwwdir/` (not decoder output; verified working
+live) and `xfirewall.php`.

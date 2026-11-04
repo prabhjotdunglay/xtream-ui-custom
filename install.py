@@ -344,6 +344,10 @@ def configure():
     printc("Configuring System")
     # Must run BEFORE `mount -a` (mount points must exist) and BEFORE start().
     makeRuntimeDirs()
+    # HTMLPurifier caches built definitions as DefinitionCache/Serializer/*/4.12.0,<hash>,1.ser.
+    # Caches written by the old decoded library would be reused by the official build (same
+    # file name), so clear them on every install. ConfigSchema/schema.ser is NOT a cache; keep it.
+    os.system("find /home/xtreamcodes/iptv_xtream_codes/admin/standalone/HTMLPurifier/DefinitionCache/Serializer -type f -name '*.ser' -delete 2>/dev/null")
     if not "/home/xtreamcodes/iptv_xtream_codes/" in open("/etc/fstab").read():
         rFile = open("/etc/fstab", "a")
         rFile.write("tmpfs /home/xtreamcodes/iptv_xtream_codes/streams tmpfs defaults,noatime,nosuid,nodev,noexec,mode=1777,size=90% 0 0\ntmpfs /home/xtreamcodes/iptv_xtream_codes/tmp tmpfs defaults,noatime,nosuid,nodev,noexec,mode=1777,size=2G 0 0")
