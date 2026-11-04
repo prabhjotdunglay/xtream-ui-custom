@@ -299,8 +299,34 @@ def decrypt():
     try: return json.loads(''.join(chr(c^ord(k)) for c,k in zip(base64.b64decode(open(rConfigPath, 'rb').read()), cycle('5709650b0d7806074842c6de575025b1'))))
     except: return None
 
+def makeRuntimeDirs():
+    # Empty runtime dirs are NOT stored in the release ZIP, so recreate them here.
+    # Missing these causes: tmpfs mount failures (streams/tmp), nginx/nginx_rtmp
+    # log-open failures (logs/), and php-fpm "failed to open error_log" (php/var/log).
+    rBase = "/home/xtreamcodes/iptv_xtream_codes"
+    rDirs = [
+        rBase + "/streams",        # tmpfs mount point (live segments)
+        rBase + "/tmp",            # tmpfs mount point (nginx client_temp etc.)
+        rBase + "/logs",           # nginx/rtmp/panel logs
+        rBase + "/tv_archive",     # catchup
+        rBase + "/php/var/log",    # php-fpm error_log
+        rBase + "/php/var/run",    # php-fpm pid/sockets
+    ]
+    for d in rDirs:
+        os.makedirs(d, exist_ok=True)
+    # Pre-create the log files start_services.sh truncates, so the echo> redirects
+    # and nginx log opens succeed on a first run.
+    for f in ["error.log", "rtmp_error.log", "rtmp_access.log", "access.log", "php-fpm.log"]:
+        rPath = rBase + "/logs/" + f
+        try: open(rPath, "a").close()
+        except OSError: pass
+    try: open(rBase + "/php/var/log/php-fpm.log", "a").close()
+    except OSError: pass
+
 def configure():
     printc("Configuring System")
+    # Must run BEFORE `mount -a` (mount points must exist) and BEFORE start().
+    makeRuntimeDirs()
     if not "/home/xtreamcodes/iptv_xtream_codes/" in open("/etc/fstab").read():
         rFile = open("/etc/fstab", "a")
         rFile.write("tmpfs /home/xtreamcodes/iptv_xtream_codes/streams tmpfs defaults,noatime,nosuid,nodev,noexec,mode=1777,size=90% 0 0\ntmpfs /home/xtreamcodes/iptv_xtream_codes/tmp tmpfs defaults,noatime,nosuid,nodev,noexec,mode=1777,size=2G 0 0")
