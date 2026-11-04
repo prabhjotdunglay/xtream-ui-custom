@@ -1,0 +1,7 @@
+# Release artifacts are uploaded as GitHub release assets, not committed
+*.zip
+main_FINAL.zip
+sub_FINAL.zip
+.DS_Store
+*.pid
+.agents/
