@@ -399,6 +399,21 @@ Kept on purpose (differ from REDSS, match BASE): `max_input_vars=5000`, `max_inp
 `opcache.blacklist_filename` for the admin dir, and BASE's `php/GeoIP.dat` (REDSS's file is a
 GeoLite2 MMDB that `libGeoIP` cannot read).
 
+Performance tuning (admin-only main server; streaming/VOD runs on LB nodes, so ffmpeg is idle here
+and was NOT swapped):
+- php.ini opcache: `opcache.enable=1` was only an implicit default and is now explicit;
+  `opcache.validate_timestamps=0` + `revalidate_freq=0` (panel code is static at runtime, so skip the
+  per-request file stat -- MUST restart php-fpm after any code update, which start_services.sh does);
+  `opcache.huge_code_pages=1`. Memory (512M) / file count (130987) were already set by BASE.
+- php.ini realpath cache: `realpath_cache_size=4096k`, `realpath_cache_ttl=600` (were commented/16k);
+  the panel resolves the same long paths every request, so caching cuts syscalls.
+- my.cnf `innodb_log_file_size=512M` (red did not set it): larger redo log batches more writes before a
+  checkpoint flush under write load. Safe on Ubuntu 24.04's MariaDB 10.11 -- it resizes/recreates the
+  redo log on restart (dynamic since 10.9), it does not refuse to start like old MySQL 5.x.
+- FPM pools left as `pm=ondemand` with high ceilings on purpose: ondemand spawns workers only when
+  needed and reaps them when idle, so the high `max_children` costs nothing at rest and auto-scales to
+  the box. Lowering it or switching to `static` would cap concurrency or hold idle workers. Not changed.
+
 Not verifiable from the build machine (macOS): `nginx -t`, `php-fpm -t`, `ldd`, and the runtime
 behaviour of every installer step. Server checks: `.agents/tasks/parity/server-commands.md`.
 `sub_FINAL.zip` (LB) does not exist yet.
