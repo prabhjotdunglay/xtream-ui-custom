@@ -388,6 +388,11 @@ Deliberately NOT applied:
   version did. To re-run the installer over an existing install without wiping data:
   `XC_DROP_DB=N python3 install.py`.
 
+- `max_statement_time = 0` (was REDSS's `100`). REDSS kills any query over 100s as a runaway guard,
+  but a large DB restore/import (2 GB uncompressed here) can legitimately run past that and get
+  killed mid-way, leaving a half-loaded database. Set to 0 (unlimited) so backups and imports of a
+  big DB complete. Everything else in red's my.cnf is unchanged.
+
 Kept on purpose (differ from REDSS, match BASE): `max_input_vars=5000`, `max_input_time=60`,
 `max_execution_time=60`, `memory_limit=2048M`, `file_uploads=On`, `upload_max_filesize=3M`
 (REDSS's smaller values truncate big bouquet forms and break stream/backup uploads),
@@ -397,9 +402,3 @@ GeoLite2 MMDB that `libGeoIP` cannot read).
 Not verifiable from the build machine (macOS): `nginx -t`, `php-fpm -t`, `ldd`, and the runtime
 behaviour of every installer step. Server checks: `.agents/tasks/parity/server-commands.md`.
 `sub_FINAL.zip` (LB) does not exist yet.
-
-## Decoder defect class: dropped float literals
-The decoder rendered float literals (1024.0, 0.8, ...) as 0. Fixed, values confirmed against REDSS source or an independent decode:
-- admin/process_monitor.php `/ 1024`; admin/episode_info.php `/ 60`; admin/database.php `+ 0.999999` (last page) and `* 0.8`
-- crons/users_checker.php `* 0.92`; crons/servers_checker.php `* 0.0078125`; crons/vod_cc_checker.php and vod_checker.php `* 0.008` (vod_checker inferred from its twin)
-- Null guards: admin/server.php, log_tools.php, stream_categories.php; installer seeds geoip_countries as `[]`.
