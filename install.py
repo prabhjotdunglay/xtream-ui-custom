@@ -11,6 +11,13 @@
 #   - Keeps the pool-of-threads MariaDB my.cnf, dynamic buffer pool sizing,
 #     UFW handling, tmpfs fstab entries, init.d + @reboot cron, and the
 #     :25500 admin nginx server block.
+#   - Parity with the reference builds (see .agents/tasks/parity/plan.md):
+#       * ISP lookup nginx server block on :8805 (MAIN and LB); access restricted to 127.0.0.1 via allow/deny in both locations
+#       * odin_blocker table (login brute-force auto-block)
+#       * /etc/hosts entries incl. bare xtream-codes.com
+#       * optional sudoers nginx-reload grant (OFF by default; XC_SUDO_NGINX_RELOAD=Y)
+#       * complete runtime directory list (created_channels, movies, delay, ...)
+#       * GeoLite2 auto-update (daily /etc/crontab + panel cron + Settings button)
 #
 import subprocess, os, random, string, sys, shutil, socket, zipfile, urllib.request, urllib.error, urllib.parse, json, base64
 from itertools import cycle
@@ -42,8 +49,9 @@ rPidMonitorURL = rRawBaseURL + "/pid_monitor.php"
 # what Settings > "Update now" runs. To use a different MaxMind account, write
 # "ACCOUNT_ID:LICENSE_KEY" to /home/xtreamcodes/iptv_xtream_codes/maxmind.key.
 
-rPackages = ["curl", "libcurl4", "libxslt1-dev", "libgeoip-dev", "libonig-dev", "e2fsprogs", "wget", "mcrypt", "nscd", "htop", "zip", "unzip", "mc", "mariadb-server", "libpng16-16", "python3-paramiko", "python-is-python3", "libzip4t64"]
+rPackages = ["curl", "libcurl4", "libxslt1-dev", "libgeoip-dev", "libonig-dev", "e2fsprogs", "wget", "mcrypt", "nscd", "htop", "zip", "unzip", "mc", "mariadb-server", "libpng16-16", "python3-paramiko", "python-is-python3", "libzip4t64", "iptables", "cron", "sudo", "libfreetype6", "libsqlite3-0"]
 rInstall = {"MAIN": "main", "LB": "sub"}
+rApplied = []  # steps that completed; printed at the end so a failed step is visible
 
 # MariaDB my.cnf tuned for Xtream Codes (pool-of-threads, {BUFFER_POOL_SIZE} template,
 # max_connections=8192, innodb_flush_log_at_trx_commit=0, max_statement_time=100, port 7999).
@@ -198,10 +206,28 @@ def install(rType="MAIN"):
             os.remove(zip_file_path)
         except OSError as e:
             printc(f"Error removing file {zip_file_path}: {e.strerror}")
+        checkLibs()
         return True
 
     printc("Failed to download installation file!", col.BRIGHT_RED)
     return False
+
+def checkLibs():
+    # Report (do not abort on) shared libraries the bundled PHP binaries cannot resolve.
+    rBase = "/home/xtreamcodes/iptv_xtream_codes"
+    rMissing = []
+    for rBin in [rBase + "/php/sbin/php-fpm", rBase + "/php/bin/php"]:
+        try:
+            rOut = subprocess.run(["ldd", rBin], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, universal_newlines=True).stdout
+        except OSError:
+            continue
+        for rLine in rOut.splitlines():
+            if "not found" in rLine: rMissing.append(rLine.strip())
+    if rMissing:
+        printc("Missing libraries for PHP:", col.BRIGHT_RED)
+        for rLine in sorted(set(rMissing)): printc(rLine, col.BRIGHT_RED)
+    else:
+        rApplied.append("library check (ldd)")
 
 def finalize(rType="MAIN"):
     # Custom: does NOT download any upstream admin release nor overwrite the
@@ -247,6 +273,10 @@ def getBufferPoolSize():
     except: pass
     return "1G"
 
+# odin_blocker: wwwdir/{get,player_api,portal,panel_api}.php INSERT here on every failed login;
+# the 10 attempts/min brute-force auto-block (blocked_ips) reads it.
+rOdinBlocker = "CREATE TABLE IF NOT EXISTS odin_blocker (id int(11) NOT NULL AUTO_INCREMENT, timestamp datetime DEFAULT NULL, ip varchar(255) DEFAULT NULL, PRIMARY KEY (id)) ENGINE=InnoDB DEFAULT CHARSET=latin1;"
+
 def mysql(rUsername, rPassword):  # handles db setup
     global rMySQLCnf
     printc("Configuring MySQL")
@@ -264,23 +294,31 @@ def mysql(rUsername, rPassword):  # handles db setup
         print(" ")
         if len(rMySQLRoot) > 0: rExtra = " -p%s" % rMySQLRoot
         else: rExtra = ""
-        rDrop = True
+        # Default (as in every earlier version of this installer): drop and recreate the database.
+        # To re-run the installer over an existing install WITHOUT wiping its data, run it as
+        #   XC_DROP_DB=N python3 install.py
+        # No prompt on purpose: an Enter press must never skip creating the database on a fresh box.
+        rDrop = os.environ.get("XC_DROP_DB", "Y").strip().upper() != "N"
         try:
             if rDrop:
                 os.system('mysql -u root%s -e "DROP DATABASE IF EXISTS xtream_iptvpro; CREATE DATABASE IF NOT EXISTS xtream_iptvpro;" > /dev/null' % rExtra)
                 os.system('mysql -u root%s -e "USE xtream_iptvpro; DROP USER IF EXISTS \'%s\'@\'%%\';" > /dev/null' % (rExtra, rUsername))
                 os.system("mysql -u root%s xtream_iptvpro < /home/xtreamcodes/iptv_xtream_codes/database.sql > /dev/null" % rExtra)
+                os.system('mysql -u root%s -e "USE xtream_iptvpro; DROP TABLE IF EXISTS odin_blocker; %s" > /dev/null' % (rExtra, rOdinBlocker))
                 os.system('mysql -u root%s -e "USE xtream_iptvpro; UPDATE settings SET live_streaming_pass = \'%s\', unique_id = \'%s\', crypt_load_balancing = \'%s\';" > /dev/null' % (rExtra, generate(20), generate(10), generate(20)))
                 # Pin the displayed version to "R1 ODIN v46" (the "46" comes from
                 # admin_settings.panel_version; $rRelease="R1" + $rEarlyAccess=" ODIN v").
                 # panel_version / geolite2_version live in the admin_settings key/value
                 # table (type/value), not in `settings`, so seed them there. Seed a
                 # current-ish geolite2_version so no GeoLite "update available" nag shows.
-                os.system('mysql -u root%s -e "USE xtream_iptvpro; CREATE TABLE IF NOT EXISTS admin_settings (type varchar(255) NOT NULL, value text, PRIMARY KEY (type)) ENGINE=InnoDB DEFAULT CHARSET=latin1; REPLACE INTO admin_settings (type, value) VALUES (\'panel_version\', \'46\'), (\'geolite2_version\', \'20261016\');" > /dev/null' % rExtra)
+                os.system('mysql -u root%s -e "USE xtream_iptvpro; CREATE TABLE IF NOT EXISTS admin_settings (type varchar(255) NOT NULL, value text, PRIMARY KEY (type)) ENGINE=InnoDB DEFAULT CHARSET=latin1; REPLACE INTO admin_settings (type, value) VALUES (\'panel_version\', \'46\'), (\'geolite2_version\', \'20210223\');" > /dev/null' % rExtra)
                 os.system('mysql -u root%s -e "USE xtream_iptvpro; REPLACE INTO streaming_servers (id, server_name, domain_name, server_ip, vpn_ip, ssh_password, ssh_port, diff_time_main, http_broadcast_port, total_clients, system_os, network_interface, latency, status, enable_geoip, geoip_countries, last_check_ago, can_delete, server_hardware, total_services, persistent_connections, rtmp_port, geoip_type, isp_names, isp_type, enable_isp, boost_fpm, http_ports_add, network_guaranteed_speed, https_broadcast_port, https_ports_add, whitelist_ips, watchdog_data, timeshift_only) VALUES (1, \'Main Server\', \'\', \'%s\', \'\', NULL, NULL, 0, 25461, 1000, \'%s\', \'eth0\', 0, 1, 0, \'\', 0, 0, \'{}\', 3, 0, 25462, \'low_priority\', \'\', \'low_priority\', 0, 1, \'\', 1000, 25463, \'\', \'[\"127.0.0.1\",\"\"]\', \'{}\', 0);" > /dev/null' % (rExtra, getIP(), getVersion()))
                 os.system('mysql -u root%s -e "USE xtream_iptvpro; REPLACE INTO reg_users (id, username, password, email, member_group_id, verified, status) VALUES (1, \'admin\', \'\\$6\\$rounds=20000\\$xtreamcodes\\$XThC5OwfuS0YwS4ahiifzF14vkGbGsFF1w7ETL4sRRC5sOrAWCjWvQJDromZUQoQuwbAXAFdX3h3Cp3vqulpS0\', \'admin@website.com\', 1, 1, 1);" > /dev/null'  % rExtra)
                 os.system('mysql -u root%s -e "CREATE USER \'%s\'@\'%%\' IDENTIFIED BY \'%s\'; GRANT ALL PRIVILEGES ON xtream_iptvpro.* TO \'%s\'@\'%%\' WITH GRANT OPTION; GRANT SELECT, LOCK TABLES ON *.* TO \'%s\'@\'%%\';FLUSH PRIVILEGES;" > /dev/null' % (rExtra, rUsername, rPassword, rUsername, rUsername))
                 os.system('mysql -u root%s -e "USE xtream_iptvpro; CREATE TABLE IF NOT EXISTS dashboard_statistics (id int(11) NOT NULL AUTO_INCREMENT, type varchar(16) NOT NULL DEFAULT \'\', time int(16) NOT NULL DEFAULT \'0\', count int(16) NOT NULL DEFAULT \'0\', PRIMARY KEY (id)) ENGINE=InnoDB DEFAULT CHARSET=latin1; INSERT INTO dashboard_statistics (type, time, count) VALUES(\'conns\', UNIX_TIMESTAMP(), 0),(\'users\', UNIX_TIMESTAMP(), 0);\" > /dev/null' % rExtra)
+            else:
+                # keep existing data, but make sure the brute-force table exists
+                os.system('mysql -u root%s -e "USE xtream_iptvpro; %s" > /dev/null' % (rExtra, rOdinBlocker))
             try: os.remove("/home/xtreamcodes/iptv_xtream_codes/database.sql")
             except: pass
             return True
@@ -324,6 +362,17 @@ def makeRuntimeDirs():
         rBase + "/php/var/log",    # php-fpm error_log
         rBase + "/php/var/run",    # php-fpm pid/sockets
         rBase + "/php/var/sessions",  # PHP session.save_path (admin login sessions)
+        rBase + "/created_channels",  # CREATED_CHANNELS
+        rBase + "/movies",         # MOVIES_PATH
+        rBase + "/delay",          # DELAY_STREAM
+        rBase + "/adtools/backups",
+        rBase + "/adtools/balancer",  # start_services.sh clears *.json here
+        rBase + "/admin/icons",    # admin/resize.php writes its resized-icon cache here (REDSS ships it)
+        rBase + "/nginx_rtmp/client_body_temp",
+        rBase + "/nginx_rtmp/fastcgi_temp",
+        rBase + "/nginx_rtmp/proxy_temp",
+        rBase + "/nginx_rtmp/scgi_temp",
+        rBase + "/nginx_rtmp/uwsgi_temp",
     ]
     for d in rDirs:
         os.makedirs(d, exist_ok=True)
@@ -335,7 +384,36 @@ def makeRuntimeDirs():
         except OSError: pass
     try: open(rBase + "/php/var/log/php-fpm.log", "a").close()
     except OSError: pass
+    rApplied.append("runtime directories")
 
+def writeSudoers():
+    # OPT-IN ONLY (XC_SUDO_NGINX_RELOAD=Y). Neither BASE nor REDSS grants this. It would let the
+    # xtreamcodes user run "nginx -s reload" as root, but that user owns (and can overwrite) the
+    # nginx binaries in the panel tree, so the grant is effectively root for anything that
+    # compromises a panel worker. The default sudoers entries (iptables, chattr) are written
+    # by configure() exactly as in the earlier installers.
+    if os.environ.get("XC_SUDO_NGINX_RELOAD", "N").strip().upper() != "Y":
+        return False
+    rBase = "/home/xtreamcodes/iptv_xtream_codes"
+    rLine = "xtreamcodes ALL=(root) NOPASSWD: %s/nginx/sbin/nginx -s reload, %s/nginx_rtmp/sbin/nginx_rtmp -s reload\n" % (rBase, rBase)
+    import tempfile
+    rFd, rTmp = tempfile.mkstemp(prefix="xc_sudoers_")
+    try:
+        os.makedirs("/etc/sudoers.d", exist_ok=True)
+        with os.fdopen(rFd, "w") as rFile: rFile.write(rLine)
+        os.chmod(rTmp, 0o440)
+        if os.system("visudo -cf %s > /dev/null 2>&1" % rTmp) != 0:
+            printc("sudoers drop-in failed validation, left untouched", col.BRIGHT_RED)
+            os.remove(rTmp)
+            return False
+        shutil.move(rTmp, "/etc/sudoers.d/xtreamcodes-nginx")
+        os.chmod("/etc/sudoers.d/xtreamcodes-nginx", 0o440)
+        os.system("chown root:root /etc/sudoers.d/xtreamcodes-nginx > /dev/null")
+        rApplied.append("sudoers nginx reload (opt-in)")
+        return True
+    except OSError as e:
+        printc("sudoers drop-in failed: %s" % e.strerror, col.BRIGHT_RED)
+        return False
 def configure():
     printc("Configuring System")
     # Must run BEFORE `mount -a` (mount points must exist) and BEFORE start().
@@ -350,6 +428,7 @@ def configure():
         rFile.close()
     if not "xtreamcodes" in open("/etc/sudoers").read():
         os.system('echo "xtreamcodes ALL = (root) NOPASSWD: /sbin/iptables, /usr/bin/chattr" >> /etc/sudoers')
+    writeSudoers()  # no-op unless XC_SUDO_NGINX_RELOAD=Y
     if not os.path.exists("/etc/init.d/xtreamcodes"):
         rFile = open("/etc/init.d/xtreamcodes", "w")
         rFile.write("#! /bin/bash\n/home/xtreamcodes/iptv_xtream_codes/start_services.sh")
@@ -368,12 +447,16 @@ def configure():
         os.system("curl -L -s -o /home/xtreamcodes/iptv_xtream_codes/crons/pid_monitor.php %s" % rPidMonitorURL)
     os.system("chown xtreamcodes:xtreamcodes -R /home/xtreamcodes > /dev/null")
     os.system("chmod -R 0777 /home/xtreamcodes > /dev/null")
+    # make sure every binary/script the stack executes keeps its exec bit
+    rBase = "/home/xtreamcodes/iptv_xtream_codes"
+    for rExec in ["start_services.sh", "kill_pids", "permissions.sh", "check_geolite.sh", "bin/ffmpeg", "bin/ffprobe", "bin/youtube", "nginx/sbin/nginx", "nginx_rtmp/sbin/nginx_rtmp", "php/bin/php", "php/sbin/php-fpm"]:
+        os.system("chmod +x %s/%s > /dev/null 2>&1" % (rBase, rExec))
     os.system("chattr -ai /home/xtreamcodes/iptv_xtream_codes/GeoLite2.mmdb > /dev/null")
     os.system("sudo chmod 0777 /home/xtreamcodes/iptv_xtream_codes/GeoLite2.mmdb > /dev/null")
     os.system("sed -i 's|chown -R xtreamcodes:xtreamcodes /home/xtreamcodes|chown -R xtreamcodes:xtreamcodes /home/xtreamcodes 2>/dev/null|g' /home/xtreamcodes/iptv_xtream_codes/start_services.sh")
     os.system("chmod +x /home/xtreamcodes/iptv_xtream_codes/start_services.sh > /dev/null")
     os.system("mount -a")
-    os.system("chmod 0700 /home/xtreamcodes/iptv_xtream_codes/config > /dev/null")
+    os.system("chmod 0400 /home/xtreamcodes/iptv_xtream_codes/config > /dev/null")
     # Robust index.php rewrite: this build's wwwdir/index.php already redirects to
     # google.com, so the legacy "Xtream Codes Reborn" echo may be absent. Only run
     # the sed if that exact string is present, otherwise do nothing (no-op).
@@ -386,7 +469,9 @@ def configure():
         os.system("sed -i 's|echo \"Xtream Codes Reborn\";|header(\"Location: https://www.google.com/\");|g' %s" % rIndexPath)
     if not "api.xtream-codes.com" in open("/etc/hosts").read(): os.system('echo "127.0.0.1    api.xtream-codes.com" >> /etc/hosts')
     if not "downloads.xtream-codes.com" in open("/etc/hosts").read(): os.system('echo "127.0.0.1    downloads.xtream-codes.com" >> /etc/hosts')
-    if not "xtream-codes.com" in open("/etc/hosts").read(): os.system('echo "127.0.0.1    xtream-codes.com" >> /etc/hosts')
+    # leading space: plain "xtream-codes.com" also matches the api./downloads. lines written above
+    if not " xtream-codes.com" in open("/etc/hosts").read(): os.system('echo "127.0.0.1    xtream-codes.com" >> /etc/hosts')
+    rApplied.append("hosts entries")
     if not "@reboot root /home/xtreamcodes/iptv_xtream_codes/start_services.sh" in open("/etc/crontab").read(): os.system('echo "@reboot root /home/xtreamcodes/iptv_xtream_codes/start_services.sh" >> /etc/crontab')
     # Daily GeoLite2 check (safety net in case the panel's own per-minute crontab is not
     # built yet). The updater throttles itself, so extra runs never re-download early.
@@ -400,21 +485,34 @@ def updateGeoLite():
     # The shipped GeoLite2.mmdb is old; fetch the current one from MaxMind in the
     # background so the install does not wait on the download.
     printc("Updating GeoLite2 (background)")
-    os.system("/home/xtreamcodes/iptv_xtream_codes/php/bin/php /home/xtreamcodes/iptv_xtream_codes/crons/geolite_update.php force > /dev/null 2>&1 &")
+    # run as the service user so log, state file and lock end up owned by xtreamcodes
+    os.system("sudo -u xtreamcodes /home/xtreamcodes/iptv_xtream_codes/php/bin/php /home/xtreamcodes/iptv_xtream_codes/crons/geolite_update.php force > /dev/null 2>&1 &")
+    rApplied.append("GeoLite2 update started")
 
 def start(first=True):
     if first: printc("Starting Xtream Codes")
     else: printc("Restarting Xtream Codes")
     os.system("/home/xtreamcodes/iptv_xtream_codes/start_services.sh > /dev/null")
 
-def modifyNginx():
+def insertNginxBlock(rPath, rGuard, rBlock):
+    # Insert rBlock before the closing brace of http { ... } unless rGuard is already present.
+    rPrevData = open(rPath, "r").read()
+    if rGuard in rPrevData: return False
+    if not os.path.exists(f"{rPath}.xc"): shutil.copy(rPath, f"{rPath}.xc")
+    http_start_index = rPrevData.find("http {")
+    if http_start_index == -1: return False
+    http_end_index = rPrevData.rfind("}", http_start_index)
+    rData = rPrevData[:http_end_index] + rBlock + "\n}" + rPrevData[http_end_index+1:]
+    with open(rPath, "w") as rFile:
+        rFile.write(rData)
+    return True
+
+def modifyNginx(rAdmin=True):
+    # rAdmin=True: MAIN (admin :25500 + ISP :8805). rAdmin=False: LB (ISP :8805 only).
     printc("Modifying Nginx")
     rPath = "/home/xtreamcodes/iptv_xtream_codes/nginx/conf/nginx.conf"
-    rPrevData = open(rPath, "r").read()
 
-    if "listen 25500;" not in rPrevData:
-        shutil.copy(rPath, f"{rPath}.xc")
-
+    if rAdmin:
         new_server_block = """
     server {
         listen 25500;
@@ -437,14 +535,41 @@ def modifyNginx():
         }
     }
 """
+        insertNginxBlock(rPath, "listen 25500;", new_server_block)
 
-        http_start_index = rPrevData.find("http {")
-        if http_start_index != -1:
-            http_end_index = rPrevData.rfind("}", http_start_index)
-            rData = rPrevData[:http_end_index] + new_server_block + "\n}" + rPrevData[http_end_index+1:]
+    # ISP lookup endpoint: wwwdir/includes/streaming.php calls http://api.xtream-codes.com:8805/api.php
+    # (api.xtream-codes.com is mapped to 127.0.0.1 in /etc/hosts), so it must listen locally.
+    isp_server_block = """
+    #ISP CONFIGURATION
+    server {
+        listen 8805;
+        root /home/xtreamcodes/iptv_xtream_codes/isp/;
 
-            with open(rPath, "w") as rFile:
-                rFile.write(rData)
+        location / {
+            allow 127.0.0.1;
+            deny all;
+        }
+
+        location ~ \\.php$ {
+            allow 127.0.0.1;
+            deny all;
+            limit_req zone=one burst=8;
+            try_files $uri =404;
+            fastcgi_index index.php;
+            fastcgi_pass php;
+            include fastcgi_params;
+            fastcgi_buffering on;
+            fastcgi_buffers 96 32k;
+            fastcgi_buffer_size 32k;
+            fastcgi_max_temp_file_size 0;
+            fastcgi_keep_conn on;
+            fastcgi_param SCRIPT_FILENAME $document_root$fastcgi_script_name;
+            fastcgi_param SCRIPT_NAME $fastcgi_script_name;
+        }
+    }
+"""
+    if insertNginxBlock(rPath, "listen 8805;", isp_server_block) or "listen 8805;" in open(rPath).read():
+        rApplied.append("nginx ISP :8805 block")
 
 if __name__ == "__main__":
     try: rVersion = os.popen('lsb_release -sr').read().strip()
@@ -480,11 +605,12 @@ if __name__ == "__main__":
                     if not mysql(rUsername, rPassword): sys.exit(1)
                 encrypt(rHost, rUsername, rPassword, rDatabase, rServerID, rPort)
                 configure()
+                modifyNginx(rType.upper() == "MAIN")
                 if rType.upper() == "MAIN":
-                    modifyNginx()
                     finalize()
                 start()
                 updateGeoLite()
+                printc("Applied: " + ", ".join(rApplied), col.BRIGHT_GREEN)
                 printc("Installation completed!", col.GREEN, 2)
                 if rType.upper() == "MAIN":
                     printc("Please store your MySQL password: %s" % rPassword, col.BRIGHT_YELLOW)

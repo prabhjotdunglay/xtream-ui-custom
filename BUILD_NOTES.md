@@ -161,39 +161,16 @@ updates now come from **MaxMind's official endpoint** using a free license key.
     database.sql` returns nothing because the 2019 base schema has no such
     column; the panel reads them from `admin_settings` via `getAdminSettings()`.
 
-### MaxMind GeoLite2 license key — setup (REQUIRED to enable auto-update)
-The GeoLite2-City database is downloaded from MaxMind's official permalink:
-`https://download.maxmind.com/app/geoip_download?edition_id=GeoLite2-City&license_key=KEY&suffix=tar.gz`
-
-Get a **free** license key: create a MaxMind account at maxmind.com, then go to
-**Account > Manage License Keys > Generate new license key**.
-
-The updater (`crons/geolite_update.php`) reads the key at runtime, first match wins:
-1. Environment variable `MAXMIND_LICENSE_KEY`.
-2. File `/home/xtreamcodes/iptv_xtream_codes/maxmind.key` — a single line containing
-   just the key. **Recommended.** Create it on the server only:
-   ```sh
-   echo "YOUR_LICENSE_KEY" > /home/xtreamcodes/iptv_xtream_codes/maxmind.key
-   chown xtreamcodes:xtreamcodes /home/xtreamcodes/iptv_xtream_codes/maxmind.key
-   chmod 600 /home/xtreamcodes/iptv_xtream_codes/maxmind.key
-   ```
-3. The `rMaxmindKey` constant in `install.py` (last-resort fallback).
-
-> **SECURITY:** `maxmind.key` must **NEVER** be committed to the public repo
-> (`prabhjotdunglay/xtream-ui-custom`). Keep `rMaxmindKey = ""` in the committed
-> `install.py`. Add `maxmind.key` to `.gitignore`. If no key is found from any
-> source, the updater is a clean no-op (prints a message, exits 0) so keyless
-> installs never break.
-
+### MaxMind GeoLite2 credentials (superseded by section 7; kept short)
+The edition is **GeoLite2-Country** (the only data the panel reads is the country code).
+`crons/geolite_update.php` reads credentials, first match wins: env `MAXMIND_ACCOUNT_ID` /
+`MAXMIND_LICENSE_KEY`; the repo file `maxmind.key` (`ACCOUNT_ID:LICENSE_KEY`, shipped in the
+release ZIP, the place to rotate the key); the constants in the script (last-resort fallback).
+The user approved committing the free-tier key, so no manual setup is required.
 ### GeoLite2 auto-update cron
-`install.py` `configure()` appends a **weekly** cron to `/etc/crontab` that runs
-the updater as the `xtreamcodes` user:
-```
-0 4 * * 0 xtreamcodes /home/xtreamcodes/iptv_xtream_codes/php/bin/php /home/xtreamcodes/iptv_xtream_codes/crons/geolite_update.php > /dev/null 2>&1
-```
-It is harmless on keyless installs (self-skips). The in-panel "update GeoLite"
-button (`updateGeoLite2()`) runs the same script on demand.
-
+`install.py` `configure()` writes a **daily** `/etc/crontab` entry (`0 4 * * *`, user
+`xtreamcodes`) that runs the updater; the old weekly line is removed. The panel's own crontab
+also runs it every minute with a 3-day throttle. See section 7.
 ### Verified for THIS change (on the build host)
 - `grep -rn "xtreamtools(dot)org" .` → **0 matches**.
 - `php -l` (PHP 8.2.28 — stricter-than-7.4 proxy; panel runs bundled PHP 7.4.33):
@@ -211,7 +188,7 @@ button (`updateGeoLite2()`) runs the same script on demand.
 - Actual MaxMind download/extract/replace (needs a real key + network + the Linux
   `php/bin/php`, `tar`, `chattr`, `chown` — not runnable on the macOS build host).
 - That Settings shows **"Installed Version R1 ODIN v46"** with no update link.
-- That the weekly cron fires and refreshes `GeoLite2.mmdb` as `xtreamcodes`.
+- That the daily cron fires and refreshes `GeoLite2.mmdb` as `xtreamcodes`.
 - A true PHP 7.4 lint (only PHP 8.2 is available here).
 
 ---
@@ -259,7 +236,7 @@ Scripts / new files:
 - `install.py` — **new** 24.04-only, Python-3-clean hosted installer (no IonCube; placeholder repo
   URLs; pool-of-threads my.cnf; dynamic buffer pool; UFW handling; tmpfs/init.d/cron; :25500 admin
   server block; robust no-op index.php sed). This change also added: `rMaxmindKey = ""` placeholder;
-  `admin_settings` seed of `panel_version='46'` + `geolite2_version='20261016'` in `mysql()`; a weekly
+  `admin_settings` seed of `panel_version='46'` + `geolite2_version='20210223'` (build date of the shipped mmdb; replaced by the first update) in `mysql()`; a weekly
   GeoLite2 cron in `configure()`.
 - `crons/geolite_update.php` — **new** MaxMind GeoLite2-City updater (reads key from env /
   `maxmind.key` / `install.py`; downloads + extracts tar.gz; handles chattr immutability; chowns
@@ -305,8 +282,9 @@ Operator notes:
 - In the stream editor, drag **Main Server** under **Stream Source** in the Server Tree. That is
   what creates the `streams_sys` row; without it the Start button sends `server_id=0`.
 - `wwwdir/api.php` reads plural parameters: `stream_ids[]` and `servers[]`, not `stream_id`/`server_id`.
-- The ODIN blocker in `get.php` writes to an `odin_blocker` table that does not exist in
-  `database.sql`, so it is inert (its INSERT fails silently). Unchanged.
+- The ODIN blocker in `get.php` (and `player_api`, `portal`, `panel_api`) writes to an `odin_blocker`
+  table that `database.sql` does not contain. `install.py` `mysql()` now creates it, so the
+  10 failed logins/minute auto-block into `blocked_ips` works (see section 9).
 
 
 ## 6. Full decoder audit (142 decoder-output files) and HTMLPurifier replacement
@@ -365,3 +343,57 @@ live) and `xfirewall.php`.
 root-only and the check always failed: every TS client was closed as "Closed UnExp" at the next
 cron run. REDSS's pool configs carry `process.dumpable = yes`; it was missing from the three MAIN
 pools here (`php/etc/VaiIb8.conf`, `JdlJXm.conf`, `CWcfSP.conf`) and is now added.
+## 9. Runtime-configuration parity with the reference builds (REDSS / BASE)
+
+An exhaustive audit compared this tree with REDSS and BASE (php.ini, php-fpm pools, extensions,
+nginx, nginx_rtmp, scripts, installer, crons, python helpers, directory layout). Every difference
+was classified MUST-APPLY or INTENTIONAL-DIFFERENCE with evidence (no "cosmetic" verdicts). Reports:
+`.agents/tasks/parity/` (not shipped).
+
+Applied (missing from this build before):
+- `admin/tmdb.php`: removed the gettext `_()` call (the bundled PHP 7.4 has no gettext; it crashed
+  the TMDB error path).
+- `start_services.sh` and `install.py makeRuntimeDirs()`: create `php/var/{sessions,log,run}`,
+  `created_channels`, `movies`, `delay`, `adtools/{backups,balancer}`, `admin/icons`
+  (`admin/resize.php` writes its icon cache there; without it every icon request emits a PHP
+  warning into the PNG) and `nginx_rtmp/*_temp`, before the recursive chown.
+- `php/etc/streamer.conf`: `error_log` on an existing path.
+- `nginx_rtmp/conf/nginx.conf`: RTMP hooks use `127.0.0.1` instead of `localhost`.
+- `php/lib/php.ini`: removed misleading PHP 8-only JIT comments. `php/lib/php/` PEAR tree and
+  `php/php/` synced from REDSS to match the 7.4 binaries.
+- `odin_blocker` table created by the installer (`wwwdir/{get,player_api,panel_api,portal}.php`
+  insert into it on failed logins; 10 failures/min from a non-whitelisted IP auto-adds the IP to
+  `blocked_ips`). It was missing, so ODIN's brute-force protection never worked. `127.0.0.1` is now
+  in the `wwwdir/configblock_odin.php` whitelist.
+- `/etc/hosts`: the bare `xtream-codes.com` entry was never written (the guard matched the
+  `api.`/`downloads.` lines); fixed in `install.py` and `pytools/fsremake.py`.
+- nginx ISP server block on `:8805` (what `wwwdir/includes/streaming.php` calls via
+  `api.xtream-codes.com:8805`, mapped to 127.0.0.1), MAIN and LB; both locations carry
+  `allow 127.0.0.1; deny all;`.
+- Packages `iptables cron sudo libfreetype6 libsqlite3-0` plus an `ldd` check of php/php-fpm.
+- Python 2 to 3 port of `config.py` and `pytools/{config,balancer,sreload,fsremake,release}.py`
+  (24.04 has no Python 2; the balancer/Servers-page jobs depend on them).
+- `ulimit -n 262144` in `start_services.sh` (inherited by the daemons it starts).
+- `maxmind.key` shipped; Settings "Update now" requires the `adv/settings` permission;
+  `check_geolite.sh` runs the updater as `xtreamcodes`.
+
+Deliberately NOT applied:
+- No `/etc/sysctl.d` or `/etc/security/limits.d` files and no replacement `/etc/init.d/xtreamcodes`:
+  neither REDSS nor BASE has them, they only affect login sessions / are unverified, and the
+  services already set their own limits (`worker_rlimit_nofile`, `rlimit_files`).
+- No sudoers grant for `nginx -s reload`. `xtreamcodes` owns the nginx binaries (the tree is 0777),
+  so the grant would be root-equivalent. The panel's "change port" reload therefore needs a full
+  `start_services.sh`, exactly as in BASE/REDSS. To opt in anyway: `XC_SUDO_NGINX_RELOAD=Y python3 install.py`.
+- No database prompt. The installer always drops and recreates `xtream_iptvpro`, as every earlier
+  version did. To re-run the installer over an existing install without wiping data:
+  `XC_DROP_DB=N python3 install.py`.
+
+Kept on purpose (differ from REDSS, match BASE): `max_input_vars=5000`, `max_input_time=60`,
+`max_execution_time=60`, `memory_limit=2048M`, `file_uploads=On`, `upload_max_filesize=3M`
+(REDSS's smaller values truncate big bouquet forms and break stream/backup uploads),
+`opcache.blacklist_filename` for the admin dir, and BASE's `php/GeoIP.dat` (REDSS's file is a
+GeoLite2 MMDB that `libGeoIP` cannot read).
+
+Not verifiable from the build machine (macOS): `nginx -t`, `php-fpm -t`, `ldd`, and the runtime
+behaviour of every installer step. Server checks: `.agents/tasks/parity/server-commands.md`.
+`sub_FINAL.zip` (LB) does not exist yet.
