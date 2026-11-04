@@ -72,6 +72,48 @@ for t in ("odin_blocker", "signals", "streams_sys", "admin_settings"):
     r = run("mysql -u root -N -e \"SHOW TABLES FROM xtream_iptvpro LIKE '%s'\"" % t)
     (ok if r else bad)("table %s exists" % t)
 
+# ---------------------------------------------------------------- opcache
+head("PHP OPcache (compiled-code cache: makes every admin/API request cheaper)")
+php = a.dir + "/php/bin/php"
+# Config values the panel's php.ini actually loaded (CLI shares the same php.ini as FPM).
+cfg = run("%s -r 'echo ini_get(\"opcache.enable\").\"|\".ini_get(\"opcache.validate_timestamps\").\"|\".ini_get(\"opcache.memory_consumption\").\"|\".ini_get(\"realpath_cache_size\");'" % php)
+if cfg and "|" in cfg:
+    en, vts, mem, rp = (cfg.split("|") + ["", "", "", ""])[:4]
+    (ok if en in ("1", "On", "on") else bad)("opcache.enable = %s" % (en or "(unset)"))
+    (ok if vts in ("0", "", "Off", "off") else info)("opcache.validate_timestamps = %s (0 = don't re-stat files every request)" % (vts or "0"))
+    info("opcache.memory_consumption = %s MB, realpath_cache_size = %s" % (mem or "?", rp or "?"))
+else:
+    info("could not read opcache config via %s (skipped)" % php)
+# Live hit rate. CLI opcache is a SEPARATE cache from the FPM workers that serve the panel,
+# so a one-shot CLI read shows ~0 hits even when FPM is caching fine. We therefore read the
+# FPM cache through the running socket when cgi-fcgi is available; otherwise we note the limit.
+fcgi = run("command -v cgi-fcgi")
+if fcgi:
+    sock = a.dir + "/php/VaiIb8.sock"
+    scr = "<?php $s=opcache_get_status(false); if(!$s){echo 'NOSTATUS';exit;} $h=$s['opcache_statistics']; printf('%d|%d|%.2f', $h['hits'], $h['misses'], $h['opcache_hit_rate']);"
+    tmp = "/tmp/.xc_opcache_probe.php"
+    try:
+        with open(tmp, "w") as f: f.write(scr)
+        run("chown xtreamcodes:xtreamcodes %s 2>/dev/null; echo done" % tmp)  # FPM runs as xtreamcodes
+    except Exception:
+        pass
+    out = run("SCRIPT_FILENAME=%s SCRIPT_NAME=/.xc_opcache_probe.php REQUEST_METHOD=GET cgi-fcgi -bind -connect %s 2>/dev/null" % (tmp, sock))
+    try: os.remove(tmp)
+    except Exception: pass
+    m = re.search(r"(\d+)\|(\d+)\|([\d.]+)\s*$", out)
+    if m:
+        hits, miss, rate = int(m.group(1)), int(m.group(2)), float(m.group(3))
+        if hits + miss == 0:
+            info("FPM opcache is empty (hit the panel a few times, then re-run)")
+        elif rate >= 95.0:
+            ok("FPM opcache hit rate %.1f%% (%d hits / %d misses) - caching well" % (rate, hits, miss))
+        else:
+            info("FPM opcache hit rate %.1f%% (%d hits / %d misses) - low; it warms up as pages are visited" % (rate, hits, miss))
+    else:
+        info("could not read live FPM opcache stats over the socket (config check above still applies)")
+else:
+    info("install 'libfcgi-bin' (cgi-fcgi) to read the live FPM hit rate; config check above confirms it is enabled")
+
 # ---------------------------------------------------------------- admin crawl
 head("Admin panel: login and every menu page")
 log_path = a.dir + "/logs/error.log"

@@ -49,7 +49,7 @@ rPidMonitorURL = rRawBaseURL + "/pid_monitor.php"
 # what Settings > "Update now" runs. To use a different MaxMind account, write
 # "ACCOUNT_ID:LICENSE_KEY" to /home/xtreamcodes/iptv_xtream_codes/maxmind.key.
 
-rPackages = ["curl", "libcurl4", "libxslt1-dev", "libgeoip-dev", "libonig-dev", "e2fsprogs", "wget", "mcrypt", "nscd", "htop", "zip", "unzip", "mc", "mariadb-server", "libpng16-16", "python3-paramiko", "python-is-python3", "libzip4t64", "iptables", "cron", "sudo", "libfreetype6", "libsqlite3-0"]
+rPackages = ["curl", "libcurl4", "libxslt1-dev", "libgeoip-dev", "libonig-dev", "e2fsprogs", "wget", "mcrypt", "nscd", "htop", "zip", "unzip", "mc", "mariadb-server", "libpng16-16", "python3-paramiko", "python-is-python3", "libzip4t64", "iptables", "cron", "sudo", "libfreetype6", "libsqlite3-0", "libfcgi-bin"]
 rInstall = {"MAIN": "main", "LB": "sub"}
 rApplied = []  # steps that completed; printed at the end so a failed step is visible
 
