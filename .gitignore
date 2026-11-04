@@ -5,3 +5,6 @@ sub_FINAL.zip
 .DS_Store
 *.pid
 .agents/
+
+# MaxMind license key — NEVER commit
+maxmind.key

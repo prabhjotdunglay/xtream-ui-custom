@@ -121,6 +121,101 @@ Full evidence is in `.agents/tasks/verification.md`.
 
 ---
 
+## 4b. ODIN v46 pin + xtreamtools(dot)org removal + MaxMind GeoLite2 (this change)
+
+### What changed and why
+The base tree is already **R1 ODIN v46**. The third-party auto-updater host
+`xtreamtools(dot)org` (a phone-home + encrypted update pusher that could silently
+overwrite the whole panel) has been **fully removed**, the version label is
+**pinned to "R1 ODIN v46"** with no "update available" banner, and GeoLite2
+updates now come from **MaxMind's official endpoint** using a free license key.
+
+- **No more `xtreamtools(dot)org` anywhere.** `grep -rn "xtreamtools(dot)org" .` returns 0.
+  - `admin/functions.php`:
+    - `updatePanel()` is now a **no-op** (`return false;`) — it never contacts a
+      remote host and never wgets/overwrites panel files. The panel can no longer
+      self-overwrite.
+    - `updateGeoLite2()` now invokes the **local** MaxMind updater
+      (`crons/geolite_update.php`) instead of fetching from the third-party host;
+      it fails gracefully (returns false) if the updater or key is absent.
+  - `admin/settings.php`: the version-check block no longer calls
+    `file_get_contents()` on any remote JSON. `$rCurrent/$rInfos/$rGeoLite2/
+    $rUpdatePanel` are set locally to the installed version, so the
+    "`> installed`" banner branches never fire and Settings renders with no
+    update link (array access is guarded, so no undefined-index fatal).
+  - `check_geolite.sh`: repointed to call the local `crons/geolite_update.php`
+    updater (PHP) instead of wgetting from the third-party host.
+  - `pytools/balancer.py` and `pytools/fsremake.py` (the LB helper tools) had
+    their third-party helper/update URLs blanked; the remote self-overwrite block
+    in `fsremake.start()` was removed.
+
+- **Version pin → "R1 ODIN v46".**
+  - `admin/functions.php`: `$rEarlyAccess` set to `" ODIN v"` (with
+    `$rRelease = "R1"`). The trailing `46` comes from the DB.
+  - `install.py` `mysql()`: after importing `database.sql`, it now ensures the
+    `admin_settings` key/value table exists and seeds
+    `panel_version = '46'` and `geolite2_version = '20261016'`
+    (a current-ish value so no GeoLite nag shows). NOTE: `panel_version` and
+    `geolite2_version` are **rows in the `admin_settings` (type/value) table**,
+    not columns in `settings` / `database.sql` — `grep -i panel_version
+    database.sql` returns nothing because the 2019 base schema has no such
+    column; the panel reads them from `admin_settings` via `getAdminSettings()`.
+
+### MaxMind GeoLite2 license key — setup (REQUIRED to enable auto-update)
+The GeoLite2-City database is downloaded from MaxMind's official permalink:
+`https://download.maxmind.com/app/geoip_download?edition_id=GeoLite2-City&license_key=KEY&suffix=tar.gz`
+
+Get a **free** license key: create a MaxMind account at maxmind.com, then go to
+**Account > Manage License Keys > Generate new license key**.
+
+The updater (`crons/geolite_update.php`) reads the key at runtime, first match wins:
+1. Environment variable `MAXMIND_LICENSE_KEY`.
+2. File `/home/xtreamcodes/iptv_xtream_codes/maxmind.key` — a single line containing
+   just the key. **Recommended.** Create it on the server only:
+   ```sh
+   echo "YOUR_LICENSE_KEY" > /home/xtreamcodes/iptv_xtream_codes/maxmind.key
+   chown xtreamcodes:xtreamcodes /home/xtreamcodes/iptv_xtream_codes/maxmind.key
+   chmod 600 /home/xtreamcodes/iptv_xtream_codes/maxmind.key
+   ```
+3. The `rMaxmindKey` constant in `install.py` (last-resort fallback).
+
+> **SECURITY:** `maxmind.key` must **NEVER** be committed to the public repo
+> (`prabhjotdunglay/xtream-ui-custom`). Keep `rMaxmindKey = ""` in the committed
+> `install.py`. Add `maxmind.key` to `.gitignore`. If no key is found from any
+> source, the updater is a clean no-op (prints a message, exits 0) so keyless
+> installs never break.
+
+### GeoLite2 auto-update cron
+`install.py` `configure()` appends a **weekly** cron to `/etc/crontab` that runs
+the updater as the `xtreamcodes` user:
+```
+0 4 * * 0 xtreamcodes /home/xtreamcodes/iptv_xtream_codes/php/bin/php /home/xtreamcodes/iptv_xtream_codes/crons/geolite_update.php > /dev/null 2>&1
+```
+It is harmless on keyless installs (self-skips). The in-panel "update GeoLite"
+button (`updateGeoLite2()`) runs the same script on demand.
+
+### Verified for THIS change (on the build host)
+- `grep -rn "xtreamtools(dot)org" .` → **0 matches**.
+- `php -l` (PHP 8.2.28 — stricter-than-7.4 proxy; panel runs bundled PHP 7.4.33):
+  `admin/functions.php`, `admin/settings.php`, `crons/geolite_update.php` →
+  all "No syntax errors detected".
+- `python3 -m py_compile install.py` → passes.
+- `grep -c "0 >= \$level" admin/HTMLPurifier.standalone.php` → 0; two
+  `while( $level > 0 );` present (Fix B intact).
+- `php/lib/php.ini` has uncommented
+  `session.save_path = "/home/xtreamcodes/iptv_xtream_codes/php/var/sessions"` (Fix C intact).
+- `install.py` `makeRuntimeDirs()` present, called at top of `configure()` before
+  `mount -a`/`start()`, and includes `php/var/sessions` (Fix A intact).
+
+### LIVE-ONLY (retest on a real Ubuntu 24.04 box)
+- Actual MaxMind download/extract/replace (needs a real key + network + the Linux
+  `php/bin/php`, `tar`, `chattr`, `chown` — not runnable on the macOS build host).
+- That Settings shows **"Installed Version R1 ODIN v46"** with no update link.
+- That the weekly cron fires and refreshes `GeoLite2.mmdb` as `xtreamcodes`.
+- A true PHP 7.4 lint (only PHP 8.2 is available here).
+
+---
+
 ## 5. Files changed (one line each)
 
 Runtime binaries / config:
@@ -141,9 +236,16 @@ PHP source (comments/brand only — no logic change):
   — stripped the 6-line EasyToYou decoder comment header (11 files).
 - `tools/{archive,delay,panel_monitor,pipe_reader,signal_receiver,stream_monitor,watchdog_data}.php`
   — stripped the 6-line EasyToYou decoder comment header (7 files).
-- `admin/functions.php` — `$rEarlyAccess` brand string `" ODIN v"` → `" XtreamUI v"`.
-- `admin/settings.php` — visible settings-tab label `>ODIN<` → `>XtreamUI<` (`#odin`/`id="odin"`
-  anchors kept in sync, tab still toggles).
+- `admin/functions.php` — `$rEarlyAccess` pinned to `" ODIN v"` (reverts the earlier
+  `" XtreamUI v"` neutralization); `updatePanel()` gutted to a no-op; `updateGeoLite2()`
+  repointed to the local MaxMind updater; all `xtreamtools(dot)org` usage removed.
+- `admin/settings.php` — version-check block no longer calls `xtreamtools(dot)org`; version vars
+  set locally so no panel/GeoLite "update available" banner renders. (Earlier change:
+  settings-tab label `>ODIN<` → `>XtreamUI<`, anchors kept in sync, tab still toggles.)
+- `check_geolite.sh` — repointed from `xtreamtools(dot)org` to the local
+  `crons/geolite_update.php` (MaxMind) updater.
+- `pytools/balancer.py`, `pytools/fsremake.py` — third-party helper/update URLs blanked;
+  remote self-overwrite block in `fsremake.start()` removed.
 - `wwwdir/configblock_odin.php` — brand comment header neutralised to "XtreamUI Line Scanners
   Blocker" and author/discord lines dropped; filename, `$attempts`, `$ips`, and both `define()`
   lines left byte-identical (load-bearing: included by the client-API endpoints).
@@ -156,8 +258,14 @@ Scripts / new files:
   `/sbin/start-stop-daemon`; BASE log reset + balancer-json cleanup kept.
 - `install.py` — **new** 24.04-only, Python-3-clean hosted installer (no IonCube; placeholder repo
   URLs; pool-of-threads my.cnf; dynamic buffer pool; UFW handling; tmpfs/init.d/cron; :25500 admin
-  server block; robust no-op index.php sed).
-- `BUILD_NOTES.md` — **new** (this file).
+  server block; robust no-op index.php sed). This change also added: `rMaxmindKey = ""` placeholder;
+  `admin_settings` seed of `panel_version='46'` + `geolite2_version='20261016'` in `mysql()`; a weekly
+  GeoLite2 cron in `configure()`.
+- `crons/geolite_update.php` — **new** MaxMind GeoLite2-City updater (reads key from env /
+  `maxmind.key` / `install.py`; downloads + extracts tar.gz; handles chattr immutability; chowns
+  xtreamcodes; no-op if no key).
+- `BUILD_NOTES.md` — **new** (this file); §4b added for the ODIN v46 pin / xtreamtools(dot)org removal /
+  MaxMind GeoLite2 work.
 
 Intentionally unchanged:
 - `bin/` (ffmpeg 2023 + ffmpeg_2018 fallback + ffprobe* + youtube*).

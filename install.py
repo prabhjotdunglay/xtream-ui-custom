@@ -36,6 +36,16 @@ rRawBaseURL = "https://raw.githubusercontent.com/prabhjotdunglay/xtream-ui-custo
 rGeoLiteURL = rRawBaseURL + "/GeoLite2.mmdb"
 rPidMonitorURL = rRawBaseURL + "/pid_monitor.php"
 
+# MaxMind GeoLite2 license key (free, from maxmind.com account > License Keys).
+# Leave this EMPTY in the committed/published repo. The GeoLite updater
+# (crons/geolite_update.php) reads the key at runtime in this order:
+#   1. env var MAXMIND_LICENSE_KEY
+#   2. file /home/xtreamcodes/iptv_xtream_codes/maxmind.key (chmod 600, NOT committed)
+#   3. this rMaxmindKey constant (last-resort fallback)
+# With no key set anywhere, GeoLite auto-update cleanly self-skips.
+# TODO: put your free MaxMind license key here (maxmind.com account > License Keys)
+rMaxmindKey = ""
+
 rPackages = ["curl", "libcurl4", "libxslt1-dev", "libgeoip-dev", "libonig-dev", "e2fsprogs", "wget", "mcrypt", "nscd", "htop", "zip", "unzip", "mc", "mariadb-server", "libpng16-16", "python3-paramiko", "python-is-python3", "libzip4t64"]
 rInstall = {"MAIN": "main", "LB": "sub"}
 
@@ -265,6 +275,12 @@ def mysql(rUsername, rPassword):  # handles db setup
                 os.system('mysql -u root%s -e "USE xtream_iptvpro; DROP USER IF EXISTS \'%s\'@\'%%\';" > /dev/null' % (rExtra, rUsername))
                 os.system("mysql -u root%s xtream_iptvpro < /home/xtreamcodes/iptv_xtream_codes/database.sql > /dev/null" % rExtra)
                 os.system('mysql -u root%s -e "USE xtream_iptvpro; UPDATE settings SET live_streaming_pass = \'%s\', unique_id = \'%s\', crypt_load_balancing = \'%s\';" > /dev/null' % (rExtra, generate(20), generate(10), generate(20)))
+                # Pin the displayed version to "R1 ODIN v46" (the "46" comes from
+                # admin_settings.panel_version; $rRelease="R1" + $rEarlyAccess=" ODIN v").
+                # panel_version / geolite2_version live in the admin_settings key/value
+                # table (type/value), not in `settings`, so seed them there. Seed a
+                # current-ish geolite2_version so no GeoLite "update available" nag shows.
+                os.system('mysql -u root%s -e "USE xtream_iptvpro; CREATE TABLE IF NOT EXISTS admin_settings (type varchar(255) NOT NULL, value text, PRIMARY KEY (type)) ENGINE=InnoDB DEFAULT CHARSET=latin1; REPLACE INTO admin_settings (type, value) VALUES (\'panel_version\', \'46\'), (\'geolite2_version\', \'20261016\');" > /dev/null' % rExtra)
                 os.system('mysql -u root%s -e "USE xtream_iptvpro; REPLACE INTO streaming_servers (id, server_name, domain_name, server_ip, vpn_ip, ssh_password, ssh_port, diff_time_main, http_broadcast_port, total_clients, system_os, network_interface, latency, status, enable_geoip, geoip_countries, last_check_ago, can_delete, server_hardware, total_services, persistent_connections, rtmp_port, geoip_type, isp_names, isp_type, enable_isp, boost_fpm, http_ports_add, network_guaranteed_speed, https_broadcast_port, https_ports_add, whitelist_ips, watchdog_data, timeshift_only) VALUES (1, \'Main Server\', \'\', \'%s\', \'\', NULL, NULL, 0, 25461, 1000, \'%s\', \'eth0\', 0, 1, 0, \'\', 0, 0, \'{}\', 3, 0, 25462, \'low_priority\', \'\', \'low_priority\', 0, 1, \'\', 1000, 25463, \'\', \'[\"127.0.0.1\",\"\"]\', \'{}\', 0);" > /dev/null' % (rExtra, getIP(), getVersion()))
                 os.system('mysql -u root%s -e "USE xtream_iptvpro; REPLACE INTO reg_users (id, username, password, email, member_group_id, verified, status) VALUES (1, \'admin\', \'\\$6\\$rounds=20000\\$xtreamcodes\\$XThC5OwfuS0YwS4ahiifzF14vkGbGsFF1w7ETL4sRRC5sOrAWCjWvQJDromZUQoQuwbAXAFdX3h3Cp3vqulpS0\', \'admin@website.com\', 1, 1, 1);" > /dev/null'  % rExtra)
                 os.system('mysql -u root%s -e "CREATE USER \'%s\'@\'%%\' IDENTIFIED BY \'%s\'; GRANT ALL PRIVILEGES ON xtream_iptvpro.* TO \'%s\'@\'%%\' WITH GRANT OPTION; GRANT SELECT, LOCK TABLES ON *.* TO \'%s\'@\'%%\';FLUSH PRIVILEGES;" > /dev/null' % (rExtra, rUsername, rPassword, rUsername, rUsername))
@@ -311,6 +327,7 @@ def makeRuntimeDirs():
         rBase + "/tv_archive",     # catchup
         rBase + "/php/var/log",    # php-fpm error_log
         rBase + "/php/var/run",    # php-fpm pid/sockets
+        rBase + "/php/var/sessions",  # PHP session.save_path (admin login sessions)
     ]
     for d in rDirs:
         os.makedirs(d, exist_ok=True)
@@ -371,6 +388,10 @@ def configure():
     if not "downloads.xtream-codes.com" in open("/etc/hosts").read(): os.system('echo "127.0.0.1    downloads.xtream-codes.com" >> /etc/hosts')
     if not "xtream-codes.com" in open("/etc/hosts").read(): os.system('echo "127.0.0.1    xtream-codes.com" >> /etc/hosts')
     if not "@reboot root /home/xtreamcodes/iptv_xtream_codes/start_services.sh" in open("/etc/crontab").read(): os.system('echo "@reboot root /home/xtreamcodes/iptv_xtream_codes/start_services.sh" >> /etc/crontab')
+    # Weekly GeoLite2 refresh from MaxMind (runs as xtreamcodes). The updater
+    # self-skips if no MaxMind license key is configured, so this is harmless
+    # on keyless installs. See crons/geolite_update.php and BUILD_NOTES.md.
+    if not "geolite_update.php" in open("/etc/crontab").read(): os.system('echo "0 4 * * 0 xtreamcodes /home/xtreamcodes/iptv_xtream_codes/php/bin/php /home/xtreamcodes/iptv_xtream_codes/crons/geolite_update.php > /dev/null 2>&1" >> /etc/crontab')
 
 def start(first=True):
     if first: printc("Starting Xtream Codes")
