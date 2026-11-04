@@ -271,3 +271,39 @@ Intentionally unchanged:
 - `bin/` (ffmpeg 2023 + ffmpeg_2018 fallback + ffprobe* + youtube*).
 - The 3 kept php-fpm pool configs `php/etc/{VaiIb8,JdlJXm,CWcfSP}.conf`.
 - `database.sql`, nginx/rtmp `.conf` files, and the obfuscated `wwwdir` client API.
+
+
+## 5. Streaming pipeline fixes (verified live on Ubuntu 24.04, 2026-11-04)
+
+The decoded `tools/` and `crons/` PHP came from an online IonCube decoder that emits many loop
+conditions inverted, and moves the daemons' "respawn after loop" call inside the loop. Symptoms
+before the fix: Start did nothing, ffmpeg never launched, background daemons never stayed up,
+and `get.php` returned an empty 404 for every line.
+
+Fixed (each changed line carries a `// fixed:` comment):
+- `tools/stream_monitor.php`: restart loop `while (isRunning)` -> `while (!isRunning)` (the reason
+  ffmpeg never started), monitoring loop and playlist-wait loop un-inverted, timeout-kill test,
+  `sleep(1)` at end of outer loop.
+- `tools/delay.php`, `tools/archive.php`, `crons/crl_sync.php`, `crons/offline_cons.php`,
+  `crons/epg.php`, `crons/stream_errors.php`, `crons/tmp_del.php`: inverted loop conditions
+  (`feof`, `readdir`, `>=` counters); `fclose` moved out of read loops.
+- `tools/signal_receiver.php`, `tools/panel_monitor.php`, `tools/pipe_reader.php`,
+  `tools/watchdog_data.php`: each respawned itself on every loop pass and every new copy killed
+  the others, so none survived. Restored "break when the DB query fails, respawn once after the
+  loop". `panel_monitor` writes the per-line marker files (`tmp/md5(username.password)`) that
+  `xfirewall.php` requires; without it every line gets 404.
+- `start_services.sh`: also launches `panel_monitor.php` and `watchdog_data.php` at boot.
+- `admin/HTMLPurifier.standalone.php`: one more inverted `do...while` (matches upstream 4.14.0).
+- `admin/functions.php`: `$rRelease = R1;` -> `"R1"` (removes an undefined-constant warning on
+  every request).
+
+Verified on the server: Start (panel button / `api.php?action=stream&sub=start&stream_ids[]=1&servers[]=1`)
+launches stream_monitor + ffmpeg, segments appear in `streams/`, `get.php` returns the playlist,
+and `/live/<user>/<pass>/<id>.ts` delivers h264/aac.
+
+Operator notes:
+- In the stream editor, drag **Main Server** under **Stream Source** in the Server Tree. That is
+  what creates the `streams_sys` row; without it the Start button sends `server_id=0`.
+- `wwwdir/api.php` reads plural parameters: `stream_ids[]` and `servers[]`, not `stream_id`/`server_id`.
+- The ODIN blocker in `get.php` writes to an `odin_blocker` table that does not exist in
+  `database.sql`, so it is inert (its INSERT fails silently). Unchanged.
