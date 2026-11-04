@@ -92,7 +92,7 @@ def get(url, data=None, timeout=40):
 get(a.url + "/login.php")
 code, final, body, _ = get(a.url + "/login.php", urllib.parse.urlencode({"username": a.user, "password": a.pw, "referrer": ""}).encode())
 code, final, dash, _ = get(a.url + "/dashboard.php")
-if code != 200 or "login.php" in final or 'name="password"' in dash:
+if code != 200 or urllib.parse.urlparse(final).path.endswith("/login.php") or 'name="password"' in dash:
     bad("login failed (HTTP %s, ended at %s). Pass the real password with --pass" % (code, final))
     print("\nCannot crawl without a session."); sys.exit(1)
 ok("logged in as %s" % a.user)
@@ -109,12 +109,12 @@ info("%d distinct menu pages found on the dashboard" % len(links))
 rows, relogin = [], 0
 for l in links:
     code, final, body, dt = get(a.url + "/" + l)
-    lost = "login.php" in final and not l.startswith("login")
+    lost = urllib.parse.urlparse(final).path.endswith("/login.php") and not l.startswith("login")
     if lost: relogin += 1
     rows.append((l, code, dt, lost, body))
     if code >= 500 or code == 0: bad("%-34s HTTP %s" % (l, code))
     elif lost: bad("%-34s sent back to login (session or permission problem)" % l)
-    elif code == 404: bad("%-34s HTTP 404" % l)
+    elif code == 404: bad("%-34s HTTP 404 (if a --line check: 404 means no such line; the firewall has no marker for it)" % l)
 good = sum(1 for r in rows if r[1] == 200 and not r[3])
 (ok if good == len(rows) else info)("%d of %d pages returned 200 with a valid session" % (good, len(rows)))
 slow = sorted(rows, key=lambda r: -r[2])[:5]
