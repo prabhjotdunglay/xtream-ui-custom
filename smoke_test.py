@@ -84,13 +84,26 @@ if cfg and "|" in cfg:
     info("opcache.memory_consumption = %s MB, realpath_cache_size = %s" % (mem or "?", rp or "?"))
 else:
     info("could not read opcache config via %s (skipped)" % php)
-# Live hit rate. CLI opcache is a SEPARATE cache from the FPM workers that serve the panel,
-# so a one-shot CLI read shows ~0 hits even when FPM is caching fine. We therefore read the
-# FPM cache through the running socket when cgi-fcgi is available; otherwise we note the limit.
+# Live cache state, read through the FPM socket (CLI opcache is a separate cache, so a CLI
+# read would be meaningless). opcache bytecode lives in SHARED memory for the whole pool, so
+# num_cached_scripts / memory_usage are pool-wide: even the fresh worker this probe spawns
+# sees what every other worker compiled. That makes "scripts cached" a reliable signal even
+# on an idle box with short-lived ondemand workers. (The hit-RATE counter is per-pool-lifetime
+# and reads low right after a restart, so we treat it as informational only.)
 fcgi = run("command -v cgi-fcgi")
 if fcgi:
     sock = a.dir + "/php/VaiIb8.sock"
-    scr = "<?php $s=opcache_get_status(false); if(!$s){echo 'NOSTATUS';exit;} $h=$s['opcache_statistics']; printf('%d|%d|%.2f', $h['hits'], $h['misses'], $h['opcache_hit_rate']);"
+    scr = r"""<?php
+$s = opcache_get_status(false);
+if ($s === false) { echo 'NOSTATUS'; exit; }
+$st = $s['opcache_statistics'];
+$mem = $s['memory_usage'];
+$cached = isset($st['num_cached_scripts']) ? $st['num_cached_scripts'] : 0;
+$used_mb = round($mem['used_memory'] / 1048576, 1);
+$free_mb = round($mem['free_memory'] / 1048576, 1);
+$rate = isset($st['opcache_hit_rate']) ? $st['opcache_hit_rate'] : 0.0;
+printf('%%d|%%.1f|%%.1f|%%.2f', $cached, $used_mb, $free_mb, $rate);
+""" % ""
     tmp = "/tmp/.xc_opcache_probe.php"
     try:
         with open(tmp, "w") as f: f.write(scr)
@@ -100,15 +113,21 @@ if fcgi:
     out = run("SCRIPT_FILENAME=%s SCRIPT_NAME=/.xc_opcache_probe.php REQUEST_METHOD=GET cgi-fcgi -bind -connect %s 2>/dev/null" % (tmp, sock))
     try: os.remove(tmp)
     except Exception: pass
-    m = re.search(r"(\d+)\|(\d+)\|([\d.]+)\s*$", out)
-    if m:
-        hits, miss, rate = int(m.group(1)), int(m.group(2)), float(m.group(3))
-        if hits + miss == 0:
-            info("FPM opcache is empty (hit the panel a few times, then re-run)")
-        elif rate >= 95.0:
-            ok("FPM opcache hit rate %.1f%% (%d hits / %d misses) - caching well" % (rate, hits, miss))
+    m = re.search(r"(\d+)\|([\d.]+)\|([\d.]+)\|([\d.]+)\s*$", out)
+    if "NOSTATUS" in out:
+        info("opcache reports no status (is zend_extension=opcache.so loaded in FPM?)")
+    elif m:
+        cached, used, free, rate = int(m.group(1)), float(m.group(2)), float(m.group(3)), float(m.group(4))
+        # num_cached_scripts is the honest signal: how many panel files are compiled and sitting
+        # in the shared cache right now. It does NOT depend on worker lifetime, so it's reliable
+        # even on an idle box where ondemand workers come and go. The hit rate is informational
+        # (it's low right after a restart and climbs with real traffic; don't read too much into it).
+        if cached >= 20:
+            ok("FPM opcache populated: %d scripts cached, %.1f MB used / %.1f MB free (lifetime hit rate %.1f%%)" % (cached, used, free, rate))
+        elif cached > 0:
+            info("FPM opcache has %d scripts cached (%.1f MB used) - low; this worker is fresh, it fills as pages load" % (cached, used))
         else:
-            info("FPM opcache hit rate %.1f%% (%d hits / %d misses) - low; it warms up as pages are visited" % (rate, hits, miss))
+            info("FPM opcache is empty on this worker - hit a few admin pages, then re-run")
     else:
         info("could not read live FPM opcache stats over the socket (config check above still applies)")
 else:
