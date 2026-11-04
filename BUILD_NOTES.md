@@ -355,3 +355,13 @@ live) and `xfirewall.php`.
   swapped in atomically; the file stays `chattr +i`. Log: `logs/geolite_update.log`.
 - Removed from `crons/servers_checker.php`: the legacy daily `wget` of
   `http://downloads.xtream-codes.com/v2/GeoLite2.mmdb` (defunct third-party domain).
+
+
+## 8. Clients dropped after a few seconds (connections show 0)
+
+`crons/users_checker.php` (every minute) checks each live connection with
+`ps_running(pid, "php-fpm")`, which reads `/proc/<php-fpm worker>/exe`. php-fpm workers run as
+`xtreamcodes` after a setuid from root, which makes them non-dumpable, so `/proc/<pid>/exe` is
+root-only and the check always failed: every TS client was closed as "Closed UnExp" at the next
+cron run. REDSS's pool configs carry `process.dumpable = yes`; it was missing from the three MAIN
+pools here (`php/etc/VaiIb8.conf`, `JdlJXm.conf`, `CWcfSP.conf`) and is now added.
