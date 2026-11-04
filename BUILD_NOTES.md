@@ -402,9 +402,14 @@ GeoLite2 MMDB that `libGeoIP` cannot read).
 Performance tuning (admin-only main server; streaming/VOD runs on LB nodes, so ffmpeg is idle here
 and was NOT swapped):
 - php.ini opcache: `opcache.enable=1` was only an implicit default and is now explicit;
-  `opcache.validate_timestamps=0` + `revalidate_freq=0` (panel code is static at runtime, so skip the
-  per-request file stat -- MUST restart php-fpm after any code update, which start_services.sh does);
-  `opcache.huge_code_pages=1`. Memory (512M) / file count (130987) were already set by BASE.
+  `opcache.validate_timestamps=1` + `revalidate_freq=60`; `opcache.huge_code_pages=1`. Memory (512M) /
+  file count (130987) were already set by BASE.
+  IMPORTANT: validate_timestamps MUST stay 1. An earlier build set it to 0 for a small perf gain, but
+  the panel caches live/VOD data as PHP files (tmp/*_main.php, bouquets_cache.php, categories_bouq)
+  loaded via include(). With timestamps off, php-fpm compiles those once and never re-reads them, so a
+  stream/bouquet added in the admin never reaches get.php / player_api until a full php-fpm restart
+  (this manifested as "only the first stream shows in the m3u"). revalidate_freq=60 re-stats a file at
+  most once per minute per worker (negligible) and lets admin changes appear within ~60s automatically.
 - php.ini realpath cache: `realpath_cache_size=4096k`, `realpath_cache_ttl=600` (were commented/16k);
   the panel resolves the same long paths every request, so caching cuts syscalls.
 - my.cnf `innodb_log_file_size=512M` (red did not set it): larger redo log batches more writes before a

@@ -81,11 +81,14 @@ cron = run("cat /etc/crontab 2>/dev/null") + "\n" + run("crontab -l -u xtreamcod
 head("PHP OPcache (compiled-code cache: makes every admin/API request cheaper)")
 php = a.dir + "/php/bin/php"
 # Config values the panel's php.ini actually loaded (CLI shares the same php.ini as FPM).
-cfg = run("%s -r 'echo ini_get(\"opcache.enable\").\"|\".ini_get(\"opcache.validate_timestamps\").\"|\".ini_get(\"opcache.memory_consumption\").\"|\".ini_get(\"realpath_cache_size\");'" % php)
+cfg = run("%s -r 'echo ini_get(\"opcache.enable\").\"|\".ini_get(\"opcache.validate_timestamps\").\"|\".ini_get(\"opcache.revalidate_freq\").\"|\".ini_get(\"opcache.memory_consumption\").\"|\".ini_get(\"realpath_cache_size\");'" % php)
 if cfg and "|" in cfg:
-    en, vts, mem, rp = (cfg.split("|") + ["", "", "", ""])[:4]
+    en, vts, rvf, mem, rp = (cfg.split("|") + ["", "", "", "", ""])[:5]
     (ok if en in ("1", "On", "on") else bad)("opcache.enable = %s" % (en or "(unset)"))
-    (ok if vts in ("0", "", "Off", "off") else info)("opcache.validate_timestamps = %s (0 = don't re-stat files every request)" % (vts or "0"))
+    # validate_timestamps MUST be on: the panel's tmp/*_main.php caches are PHP includes, so with
+    # it off, FPM never re-reads them and admin-added streams never reach the m3u until a restart.
+    (ok if vts in ("1", "On", "on") else bad)("opcache.validate_timestamps = %s (must be 1, else cache files never refresh -> new streams missing from m3u)" % (vts or "0"))
+    info("opcache.revalidate_freq = %ss (how fast rewritten cache files are picked up)" % (rvf or "0"))
     info("opcache.memory_consumption = %s MB, realpath_cache_size = %s" % (mem or "?", rp or "?"))
 else:
     info("could not read opcache config via %s (skipped)" % php)
