@@ -480,6 +480,12 @@ def configure():
         os.system("sed -i '\\|geolite_update.php|d' /etc/crontab")
         rCrontab = open("/etc/crontab").read()
     if not "geolite_update.php" in rCrontab: os.system('echo "0 4 * * * xtreamcodes /home/xtreamcodes/iptv_xtream_codes/php/bin/php /home/xtreamcodes/iptv_xtream_codes/crons/geolite_update.php > /dev/null 2>&1" >> /etc/crontab')
+    # Rebuild the playlist/stream cache every minute. start_services.sh only runs setup_cache.php
+    # ONCE at boot; without this recurring job, streams/bouquets added through the admin never
+    # appear in get.php / the m3u until the next full restart (the tmp cache stays frozen).
+    # This is the stock cache-refresh cadence; setup_cache.php is cheap and idempotent (it only
+    # rewrites a cache file when its md5 changed).
+    if not "setup_cache.php" in rCrontab: os.system('echo "* * * * * xtreamcodes /home/xtreamcodes/iptv_xtream_codes/php/bin/php /home/xtreamcodes/iptv_xtream_codes/crons/setup_cache.php > /dev/null 2>&1" >> /etc/crontab')
 
 def updateGeoLite():
     # The shipped GeoLite2.mmdb is old; fetch the current one from MaxMind in the

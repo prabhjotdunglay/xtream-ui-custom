@@ -71,6 +71,11 @@ else:
 for t in ("odin_blocker", "signals", "streams_sys", "admin_settings"):
     r = run("mysql -u root -N -e \"SHOW TABLES FROM xtream_iptvpro LIKE '%s'\"" % t)
     (ok if r else bad)("table %s exists" % t)
+# The playlist/stream cache (tmp/*_main.php, categories_bouq) is rebuilt by setup_cache.php.
+# start_services.sh runs it only once at boot, so a recurring crontab is REQUIRED or streams
+# added via the admin never show up in get.php until the next restart. Check it's scheduled.
+cron = run("cat /etc/crontab 2>/dev/null") + "\n" + run("crontab -l -u xtreamcodes 2>/dev/null")
+(ok if "setup_cache.php" in cron else bad)("setup_cache.php is scheduled in cron (else new streams never reach the m3u)")
 
 # ---------------------------------------------------------------- opcache
 head("PHP OPcache (compiled-code cache: makes every admin/API request cheaper)")

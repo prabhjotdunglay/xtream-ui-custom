@@ -414,6 +414,14 @@ and was NOT swapped):
   needed and reaps them when idle, so the high `max_children` costs nothing at rest and auto-scales to
   the box. Lowering it or switching to `static` would cap concurrency or hold idle workers. Not changed.
 
+Cache refresh cron (fixes "new streams never appear in the m3u"): start_services.sh runs
+`crons/setup_cache.php` only ONCE at boot. The playlist/stream cache (tmp/*_main.php,
+categories_bouq, bouquets_cache.php) is served by get.php and is NOT rebuilt from the DB on every
+request. Without a recurring job, a stream or bouquet added through the admin updates the DB but
+never reaches the generated m3u until a full restart. The installer now adds a per-minute
+`xtreamcodes` crontab entry for setup_cache.php (stock cadence; it only rewrites a cache file when
+its md5 changed, so it is cheap). smoke_test.py checks the entry is present.
+
 Not verifiable from the build machine (macOS): `nginx -t`, `php-fpm -t`, `ldd`, and the runtime
 behaviour of every installer step. Server checks: `.agents/tasks/parity/server-commands.md`.
 `sub_FINAL.zip` (LB) does not exist yet.
