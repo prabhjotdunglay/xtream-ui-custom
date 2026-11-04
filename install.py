@@ -36,15 +36,11 @@ rRawBaseURL = "https://raw.githubusercontent.com/prabhjotdunglay/xtream-ui-custo
 rGeoLiteURL = rRawBaseURL + "/GeoLite2.mmdb"
 rPidMonitorURL = rRawBaseURL + "/pid_monitor.php"
 
-# MaxMind GeoLite2 license key (free, from maxmind.com account > License Keys).
-# Leave this EMPTY in the committed/published repo. The GeoLite updater
-# (crons/geolite_update.php) reads the key at runtime in this order:
-#   1. env var MAXMIND_LICENSE_KEY
-#   2. file /home/xtreamcodes/iptv_xtream_codes/maxmind.key (chmod 600, NOT committed)
-#   3. this rMaxmindKey constant (last-resort fallback)
-# With no key set anywhere, GeoLite auto-update cleanly self-skips.
-# TODO: put your free MaxMind license key here (maxmind.com account > License Keys)
-rMaxmindKey = ""
+# GeoLite2: crons/geolite_update.php ships with the MaxMind account ID / license key
+# built in, keeps GeoLite2.mmdb current automatically (checked every minute by the
+# panel's own crontab, downloads only when the file is older than 3 days), and is
+# what Settings > "Update now" runs. To use a different MaxMind account, write
+# "ACCOUNT_ID:LICENSE_KEY" to /home/xtreamcodes/iptv_xtream_codes/maxmind.key.
 
 rPackages = ["curl", "libcurl4", "libxslt1-dev", "libgeoip-dev", "libonig-dev", "e2fsprogs", "wget", "mcrypt", "nscd", "htop", "zip", "unzip", "mc", "mariadb-server", "libpng16-16", "python3-paramiko", "python-is-python3", "libzip4t64"]
 rInstall = {"MAIN": "main", "LB": "sub"}
@@ -392,10 +388,19 @@ def configure():
     if not "downloads.xtream-codes.com" in open("/etc/hosts").read(): os.system('echo "127.0.0.1    downloads.xtream-codes.com" >> /etc/hosts')
     if not "xtream-codes.com" in open("/etc/hosts").read(): os.system('echo "127.0.0.1    xtream-codes.com" >> /etc/hosts')
     if not "@reboot root /home/xtreamcodes/iptv_xtream_codes/start_services.sh" in open("/etc/crontab").read(): os.system('echo "@reboot root /home/xtreamcodes/iptv_xtream_codes/start_services.sh" >> /etc/crontab')
-    # Weekly GeoLite2 refresh from MaxMind (runs as xtreamcodes). The updater
-    # self-skips if no MaxMind license key is configured, so this is harmless
-    # on keyless installs. See crons/geolite_update.php and BUILD_NOTES.md.
-    if not "geolite_update.php" in open("/etc/crontab").read(): os.system('echo "0 4 * * 0 xtreamcodes /home/xtreamcodes/iptv_xtream_codes/php/bin/php /home/xtreamcodes/iptv_xtream_codes/crons/geolite_update.php > /dev/null 2>&1" >> /etc/crontab')
+    # Daily GeoLite2 check (safety net in case the panel's own per-minute crontab is not
+    # built yet). The updater throttles itself, so extra runs never re-download early.
+    rCrontab = open("/etc/crontab").read()
+    if "0 4 * * 0 xtreamcodes" in rCrontab and "geolite_update.php" in rCrontab:
+        os.system("sed -i '\\|geolite_update.php|d' /etc/crontab")
+        rCrontab = open("/etc/crontab").read()
+    if not "geolite_update.php" in rCrontab: os.system('echo "0 4 * * * xtreamcodes /home/xtreamcodes/iptv_xtream_codes/php/bin/php /home/xtreamcodes/iptv_xtream_codes/crons/geolite_update.php > /dev/null 2>&1" >> /etc/crontab')
+
+def updateGeoLite():
+    # The shipped GeoLite2.mmdb is old; fetch the current one from MaxMind in the
+    # background so the install does not wait on the download.
+    printc("Updating GeoLite2 (background)")
+    os.system("/home/xtreamcodes/iptv_xtream_codes/php/bin/php /home/xtreamcodes/iptv_xtream_codes/crons/geolite_update.php force > /dev/null 2>&1 &")
 
 def start(first=True):
     if first: printc("Starting Xtream Codes")
@@ -479,6 +484,7 @@ if __name__ == "__main__":
                     modifyNginx()
                     finalize()
                 start()
+                updateGeoLite()
                 printc("Installation completed!", col.GREEN, 2)
                 if rType.upper() == "MAIN":
                     printc("Please store your MySQL password: %s" % rPassword, col.BRIGHT_YELLOW)

@@ -337,3 +337,21 @@ cosmetic empty branches.
 
 Out of scope: the 33 goto-obfuscated files under `wwwdir/` (not decoder output; verified working
 live) and `xfirewall.php`.
+
+
+## 7. GeoLite2 updates (automatic + Settings button)
+
+- `crons/geolite_update.php` downloads **GeoLite2-Country** (the edition the panel ships and
+  uses; it only reads the country code) from MaxMind with the account ID / license key built
+  in. A different account can be set in `maxmind.key` as `ACCOUNT_ID:LICENSE_KEY`.
+- Automatic: the panel's own crontab runs every `crons/*.php` once a minute. The updater only
+  downloads when `GeoLite2.mmdb` is older than 3 days, backs off 24h after HTTP 429 (MaxMind's
+  daily GeoLite download limit) and 6h after other failures, and holds a lock so runs never
+  overlap. `install.py` also adds a daily `/etc/crontab` entry as a safety net and runs one
+  forced update in the background at the end of the install.
+- Manual: Settings shows **Update now** next to the GeoLite2 version (`settings.php?geolite2`,
+  which runs the updater with `force`). The version shown is MaxMind's build date.
+- Each download is validated (tar extracts, file > 1 MB, MaxMind metadata marker present) and
+  swapped in atomically; the file stays `chattr +i`. Log: `logs/geolite_update.log`.
+- Removed from `crons/servers_checker.php`: the legacy daily `wget` of
+  `http://downloads.xtream-codes.com/v2/GeoLite2.mmdb` (defunct third-party domain).
