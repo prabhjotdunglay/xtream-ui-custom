@@ -436,6 +436,20 @@ warning is cosmetic) but it was logged on every stream edit. Fixed by guarding t
 back to `$rArray` / `array()`. Symptom reported as "editing an on-demand stream throws an error even
 though the stream works" - it was this admin-save warning, NOT a streaming/ffmpeg failure.
 
+Systematic decoder-defect sweep (vs REDSS twins + signature scan, two-model reviewed): all 141
+decoder-output files (123 admin, 11 crons, 7 tools) were semantic-diffed against the clean REDSS
+source (105 twins) or signature-scanned (36 ODIN-only). Result: the build was already clean except
+ONE new defect -- `admin/tmdb_release.php` `parseTitle()`: the decoder replaced a loop `break` with
+an early `return` and dropped the post-loop `$return = trim($return); return $return;`, so the
+function returned null on normal completion (VOD/movie title parsing came back blank for messy
+filenames). Also `parseLanguage()` had a dropped inner `break` that could falsely trip MULTI.
+Restored to match REDSS. The 4 float crons got the required `// fixed:` markers added (no value
+change). All prior fixes re-verified against REDSS and intact. The 33 goto-obfuscated wwwdir runtime
+files were not touched. Flagged-not-fixed (ambiguous, no reference): json_decode foreach in
+fetch_record.php and movie_info.php (ODIN-only). Report: .agents/tasks/decoder-sweep.md.
+NOTE: lint on the mac host used system PHP 8.2 as a proxy; the canonical PHP 7.4 lint
+(php/bin/php -l) and runtime tests must still run on the Ubuntu server before production cutover.
+
 Not verifiable from the build machine (macOS): `nginx -t`, `php-fpm -t`, `ldd`, and the runtime
 behaviour of every installer step. Server checks: `.agents/tasks/parity/server-commands.md`.
 `sub_FINAL.zip` (LB) does not exist yet.
