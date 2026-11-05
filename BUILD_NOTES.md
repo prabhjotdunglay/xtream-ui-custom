@@ -427,6 +427,15 @@ never reaches the generated m3u until a full restart. The installer now adds a p
 `xtreamcodes` crontab entry for setup_cache.php (stock cadence; it only rewrites a cache file when
 its md5 changed, so it is cheap). smoke_test.py checks the entry is present.
 
+Decoder defect - dropped `$rStream = $rArray` fallback (admin save warning): `admin/stream.php`
+and `admin/radio.php` warned `Invalid argument supplied for foreach()` when saving a stream/radio
+entry on certain POST paths. REDSS source has an unconditional-ish `$rStream = $rArray` fallback
+before the `if (isset($_STATUS)) { foreach ($rStream ...) }` normaliser; the decoder dropped it, so
+on some save paths the variable was unset and the foreach warned. The save still completed (the
+warning is cosmetic) but it was logged on every stream edit. Fixed by guarding the foreach to fall
+back to `$rArray` / `array()`. Symptom reported as "editing an on-demand stream throws an error even
+though the stream works" - it was this admin-save warning, NOT a streaming/ffmpeg failure.
+
 Not verifiable from the build machine (macOS): `nginx -t`, `php-fpm -t`, `ldd`, and the runtime
 behaviour of every installer step. Server checks: `.agents/tasks/parity/server-commands.md`.
 `sub_FINAL.zip` (LB) does not exist yet.
