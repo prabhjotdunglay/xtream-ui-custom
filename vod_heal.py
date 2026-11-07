@@ -51,7 +51,7 @@ import sys
 import time
 import unicodedata
 
-VERSION = "2026-11-08-E (trial, only-ids, find-gone, peek, auto-pick-2160p, panel-info, decisions)"
+VERSION = "2026-11-08-F (cleanup export, remove-links, trial, find-gone, peek, auto-pick-2160p, panel-info, decisions)"
 
 VIDEO_EXT = {".mkv", ".mp4", ".avi", ".m4v", ".mov", ".ts", ".wmv", ".mpg", ".mpeg", ".webm"}
 JUNK_RE = re.compile(r"(?i)(^|[\W_])(sample|trailer|featurette|extras?|behind[\W_]the[\W_]scenes|deleted[\W_]scenes)([\W_]|$)")
@@ -847,11 +847,139 @@ def pick_trial(plans, n):
     return [pl for _, pl in chosen], info
 
 
+CLEANUP_CATEGORIES = collections.OrderedDict([
+    ("gone",           ("folder-missing",                     "Title folder is gone from the drive")),
+    ("missing-file",   ("folder-exists-but-no-matching-file", "Folder is there but this episode/movie file is not")),
+    ("marked-gone",    ("marked-gone-by-you",                 "You marked it GONE in the worksheet")),
+    ("lookalike",      ("look-alike-rejected",                "Only a look-alike (other year/id) exists - REVIEW BEFORE USING")),
+    ("double-episode", ("multi-episode-file",                 "Only a double-episode file exists")),
+    ("several-folders", ("several-look-alike-folders",        "Several folders share the title - REVIEW BEFORE USING")),
+    ("daily",          ("episode-name-has-no-SxxExx",         "Daily show/special with no episode number")),
+])
+
+
+def links_for_id(movies_dir, sid):
+    """All entries in movies/ named <id>.<ext> (the .pid files are named <id>_.pid and are not matched)."""
+    return glob.glob(os.path.join(glob.escape(movies_dir), glob.escape(sid) + ".*"))
+
+
+def cmd_export_cleanup(a):
+    """Read-only. Writes the list of ids that are still broken after the repair and are safe to remove from
+    the panel. Every id is re-checked against the folder RIGHT NOW: if any link for it plays, it is kept."""
+    f = latest_attention(a.log_dir)
+    if not f:
+        print("No report found in %s. Run the normal dry run first (the one that prints the SUMMARY)." % a.log_dir)
+        return 1
+    wanted = [c.strip() for c in a.cleanup_categories.split(",") if c.strip()]
+    bad = [c for c in wanted if c not in CLEANUP_CATEGORIES]
+    if bad:
+        print("Unknown category: %s. Choose from: %s" % (", ".join(bad), ", ".join(CLEANUP_CATEGORIES)))
+        return 2
+    if not os.path.isdir(a.movies_dir):
+        print("movies dir %s not found (run this on the LB)." % a.movies_dir)
+        return 3
+    print("Using report: %s" % f)
+    print("Categories included: %s" % ", ".join(wanted))
+    picked, played, per_cat, titles = [], 0, collections.Counter(), collections.defaultdict(collections.Counter)
+    seen = set()
+    for r in read_attention(f):
+        sid, detail, title, oldfile = r[0], r[4], r[2], r[3]
+        cat = next((c for c, (prefix, _) in CLEANUP_CATEGORIES.items() if detail.startswith(prefix)), None)
+        if cat not in wanted or not sid.isdigit() or sid in seen:
+            continue
+        seen.add(sid)
+        links = links_for_id(a.movies_dir, sid)
+        if any(os.path.exists(x) for x in links):
+            played += 1                      # it plays now - never remove
+            continue
+        picked.append((sid, cat, title, oldfile))
+        per_cat[cat] += 1
+        titles[cat][title] += 1
+    stamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    idfile = os.path.join(a.log_dir, "cleanup_ids_%s.txt" % stamp)
+    listfile = os.path.join(a.log_dir, "cleanup_list_%s.tsv" % stamp)
+    with open(idfile, "w") as fh:
+        fh.write(",".join(x[0] for x in picked) + "\n")
+    with open(listfile, "w", encoding="utf-8") as fh:
+        fh.write("id\tcategory\ttitle\told_file\n")
+        for x in picked:
+            fh.write("\t".join(x) + "\n")
+    print("")
+    print("=" * 66)
+    print("CLEANUP LIST   (nothing is removed by this command)")
+    print("=" * 66)
+    for c in wanted:
+        print("  %6d  %s" % (per_cat[c], CLEANUP_CATEGORIES[c][1]))
+    print("  %6d  TOTAL ids still broken and listed for removal" % len(picked))
+    if played:
+        print("  %6d  ids skipped because a link for them plays now (kept)" % played)
+    for c in wanted:
+        if titles[c]:
+            print("\nBiggest titles in '%s':" % c)
+            for t, n in titles[c].most_common(12):
+                print("  %5d  %s" % (n, t))
+    print("-" * 66)
+    print("Files in %s:" % a.log_dir)
+    print("  %s   <- the ids (give this to vod_cleanup.py on the MAIN server)" % os.path.basename(idfile))
+    print("  %s  <- readable list: id, category, title, old file" % os.path.basename(listfile))
+    return 0
+
+
+def cmd_remove_links(a):
+    """Removes DEAD symlinks (target missing) for the ids in a file. A link that plays is never removed."""
+    if not os.path.isfile(a.remove_links):
+        print("ids file not found: %s" % a.remove_links)
+        return 1
+    if not os.path.isdir(a.movies_dir):
+        print("movies dir %s not found (run this on the LB)." % a.movies_dir)
+        return 3
+    ids = re.findall(r"\d+", open(a.remove_links).read())
+    dead, alive, none_ = [], 0, 0
+    for sid in ids:
+        links = links_for_id(a.movies_dir, sid)
+        if not links:
+            none_ += 1
+            continue
+        if any(os.path.exists(x) for x in links):
+            alive += 1                       # something for this id plays: leave ALL its links alone
+            continue
+        dead += [x for x in links if os.path.islink(x)]
+    stamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    print("ids in file                : %d" % len(ids))
+    print("dead links to remove       : %d" % len(dead))
+    print("ids with a working link    : %d  (kept, untouched)" % alive)
+    print("ids with no link in movies/: %d" % none_)
+    if not a.apply:
+        print("DRY RUN - nothing removed. Add --apply to remove the dead links.")
+        return 0
+    os.makedirs(a.log_dir, exist_ok=True)
+    logp = os.path.join(a.log_dir, "removed_links_%s.tsv" % stamp)
+    n = 0
+    with open(logp, "w", encoding="utf-8") as fh:
+        for x in dead:
+            try:
+                t = os.readlink(x)
+                os.unlink(x)
+                fh.write("%s\t%s\n" % (x, t))
+                n += 1
+            except OSError:
+                pass
+    print("removed %d dead links. Log: %s" % (n, logp))
+    return 0
+
+
 def main():
     ap = argparse.ArgumentParser(description="Repair VOD symlinks broken by Radarr/Sonarr upgrades.")
     ap.add_argument("--version", action="version", version="vod_heal " + VERSION)
     ap.add_argument("--find-gone", action="store_true",
                     help="READ-ONLY check: are the titles reported as 'gone' really gone, or just somewhere else on the drive?")
+    ap.add_argument("--export-cleanup", action="store_true",
+                    help="READ-ONLY: write the list of ids that are still broken and safe to remove from the panel")
+    ap.add_argument("--cleanup-categories", default="gone,missing-file,marked-gone",
+                    help="which groups --export-cleanup includes (default gone,missing-file,marked-gone; "
+                         "others: lookalike, double-episode, several-folders, daily)")
+    ap.add_argument("--remove-links", metavar="IDS_FILE",
+                    help="remove the DEAD links in movies/ for the ids in this file (dry run unless --apply)")
     ap.add_argument("--peek", action="store_true",
                     help="READ-ONLY: show a few real examples of the groups that need a human look")
     ap.add_argument("--search-root", default="/mnt/unionfs", help="where --find-gone looks (default /mnt/unionfs)")
@@ -907,6 +1035,10 @@ def main():
         return 0
     if a.find_gone:
         return cmd_find_gone(a)
+    if a.export_cleanup:
+        return cmd_export_cleanup(a)
+    if a.remove_links:
+        return cmd_remove_links(a)
     if a.peek:
         return cmd_peek(a)
 
