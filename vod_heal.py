@@ -51,7 +51,7 @@ import sys
 import time
 import unicodedata
 
-VERSION = "2026-11-08-D (find-gone, peek, auto-pick-2160p, panel-info, decisions)"
+VERSION = "2026-11-08-E (trial, only-ids, find-gone, peek, auto-pick-2160p, panel-info, decisions)"
 
 VIDEO_EXT = {".mkv", ".mp4", ".avi", ".m4v", ".mov", ".ts", ".wmv", ".mpg", ".mpeg", ".webm"}
 JUNK_RE = re.compile(r"(?i)(^|[\W_])(sample|trailer|featurette|extras?|behind[\W_]the[\W_]scenes|deleted[\W_]scenes)([\W_]|$)")
@@ -802,6 +802,51 @@ def cmd_peek(a):
     return 0
 
 
+def pick_trial(plans, n):
+    """Choose a small, VARIED set of repairs to try first: episodes, movies, file-type changes, moved
+    folders, panel-year and best-quality picks. Returns (chosen_plans, info_rows)."""
+    def kinds(pl):
+        k = []
+        base = os.path.basename(pl["old"])
+        k.append("episode" if first_episode(base) is not None else ("daily-show" if air_date(base) else "movie"))
+        if pl["link_ext"] != pl["new_ext"]:
+            k.append("file-type-change")
+        if os.path.dirname(pl["old"]) != os.path.dirname(pl["new"]):
+            k.append("moved-folder")
+        if "via-panel-year" in pl["note"]:
+            k.append("panel-year")
+        if "best-quality" in pl["note"]:
+            k.append("best-quality")
+        return k
+    rnd = random.Random(2026)      # fixed seed + sorted input: the dry run and the real run pick the SAME links
+    plans = sorted(plans, key=lambda x: x["link"])
+    buckets = collections.OrderedDict((k, []) for k in
+                                      ("movie", "episode", "file-type-change", "moved-folder", "panel-year",
+                                       "best-quality", "daily-show"))
+    tagged = {}
+    for pl in plans:
+        ks = kinds(pl)
+        tagged[id(pl)] = ks
+        for k in ks:
+            buckets[k].append(pl)
+    for b in buckets.values():
+        rnd.shuffle(b)
+    chosen, seen = [], set()
+    while len(chosen) < n and any(buckets.values()):
+        for k, b in buckets.items():
+            while b and id(b[-1]) in seen:
+                b.pop()
+            if b and len(chosen) < n:
+                pl = b.pop()
+                seen.add(id(pl))
+                chosen.append((k, pl))
+    info = []
+    for k, pl in chosen:
+        info.append((k, pl["id"], title_of(pl["old"]), os.path.basename(pl["old"]), os.path.basename(pl["new"]),
+                     "+".join(tagged[id(pl)])))
+    return [pl for _, pl in chosen], info
+
+
 def main():
     ap = argparse.ArgumentParser(description="Repair VOD symlinks broken by Radarr/Sonarr upgrades.")
     ap.add_argument("--version", action="version", version="vod_heal " + VERSION)
@@ -829,6 +874,12 @@ def main():
                     help="the worksheet_*.tsv you filled in. In its 'decision' column put: a folder path "
                          "(look for the files there), OK (accept the one clean suggestion), GONE (deleted "
                          "for good; listed in gone_ids_*.txt for later cleanup) or SKIP (leave alone)")
+    ap.add_argument("--trial", type=int, metavar="N",
+                    help="repair only N varied links first (a mix of movies, episodes, file-type changes, moved "
+                         "folders...), so you can play them before doing the rest. Without --apply it just shows "
+                         "which N it would pick")
+    ap.add_argument("--only-ids", metavar="FILE_OR_LIST",
+                    help="repair only these stream ids (a file, or comma-separated)")
     ap.add_argument("--skip-ids", metavar="FILE_OR_LIST",
                     help="ids the tool must never touch: a file, or a comma-separated list "
                          "(use for any pairing you rejected on review)")
@@ -957,6 +1008,11 @@ def main():
     if a.skip_ids:
         raw = open(a.skip_ids).read() if os.path.isfile(a.skip_ids) else a.skip_ids
         skip = set(re.findall(r"\d+", raw))
+    only = set()
+    if a.only_ids:
+        raw = open(a.only_ids).read() if os.path.isfile(a.only_ids) else a.only_ids
+        only = set(re.findall(r"\d+", raw))
+    plans = []
     for link, old in broken:
         name = os.path.basename(link)
         mid = re.match(r"^(\d+)\.", name)
@@ -973,12 +1029,25 @@ def main():
             rows.append(("UNRESOLVED", link, old, "", note))
             unresolved += 1
             continue
+        plans.append({"link": link, "old": old, "new": new, "note": note, "name": name,
+                      "id": mid.group(1) if mid else "",
+                      "link_ext": os.path.splitext(name)[1].lower(),
+                      "new_ext": os.path.splitext(new)[1].lower()})
+
+    # ---- which repairs to do now: all (default), only the listed ids, or a small varied trial ----
+    chosen = [p for p in plans if p["id"] in only] if only else plans
+    trial_info = []
+    if a.trial:
+        chosen, trial_info = pick_trial(chosen, a.trial)
+    held = len(plans) - len(chosen)
+
+    for p_ in chosen:
+        link, old, new, note, name = p_["link"], p_["old"], p_["new"], p_["note"], p_["name"]
         flag = ""
-        link_ext = os.path.splitext(name)[1].lower()
-        new_ext = os.path.splitext(new)[1].lower()
-        ext_differs = link_ext != new_ext
+        ext_differs = p_["link_ext"] != p_["new_ext"]
+        new_ext = p_["new_ext"]
         if ext_differs:
-            flag = "EXT_MISMATCH(link %s, file %s)" % (link_ext, new_ext)
+            flag = "EXT_MISMATCH(link %s, file %s)" % (p_["link_ext"], new_ext)
             ext_mismatch += 1
             if a.skip_ext_change:
                 rows.append(("SKIPPED_EXT", link, old, new, flag))
@@ -994,7 +1063,6 @@ def main():
                 continue
         fixed += 1
         rows.append((status, link, old, new, " ".join(x for x in (note, flag) if x)))
-
         if ext_differs and a.add_ext_link:
             m_id = re.match(r"^(\d+)\.", name)
             if m_id:
@@ -1010,7 +1078,6 @@ def main():
                             continue
                     rows.append(("ADDED" if a.apply else "WOULD_ADD", extra, "", new, ""))
                     ext_ids.setdefault(new_ext.lstrip("."), []).append(m_id.group(1))
-
     # --- 3) reports ---
     tsv = os.path.join(a.log_dir, "heal_%s.tsv" % stamp)
     with open(tsv, "w", encoding="utf-8") as f:
@@ -1126,6 +1193,9 @@ def main():
         print("     REPAIRED ................ %d" % fixed)
     else:
         print("     CAN BE REPAIRED ......... %d   <- run again with --apply" % fixed)
+    if held:
+        print("     HELD BACK FOR LATER ..... %d   (not part of this %s; still broken, untouched)"
+              % (held, "trial" if a.trial else "selection"))
     print("     NEEDS YOUR ATTENTION .... %d" % len(attn))
     for k, v in reasons.most_common():
         print("          %6d  %s" % (v, k))
@@ -1144,6 +1214,24 @@ def main():
     print("  heal_%s.tsv              <- every link and what happened (also used for --undo)" % stamp)
     if sqlfile:
         print("  %s  <- run on the PANEL database after applying" % os.path.basename(sqlfile))
+    if trial_info:
+        trial_file = os.path.join(a.log_dir, "trial_%s.tsv" % stamp)
+        with open(trial_file, "w", encoding="utf-8") as fh:
+            fh.write("kind\tid\ttitle\told_file\tnew_file\ttags\n")
+            for t in trial_info:
+                fh.write("\t".join(t) + "\n")
+        print("")
+        print("TRIAL: %s these %d links (a mix of kinds, so each type of repair gets tested):"
+              % ("repaired" if a.apply else "would repair", len(trial_info)))
+        for k, i, title, oldn, newn, tags in trial_info:
+            print("  id %-8s [%s]  %s" % (i, k, title))
+            print("      was: %s" % oldn[:100])
+            print("      now: %s" % newn[:100])
+        print("")
+        print("To see the names in your panel, run this on the main database server:")
+        print("  SELECT id, stream_display_name FROM streams WHERE id IN (%s);" % ",".join(t[1] for t in trial_info))
+        print("Play these in the panel / your app. If they are fine, run the same command again WITHOUT")
+        print("--trial to repair the rest. If not, undo with:  python3 %s --undo %s" % (os.path.abspath(sys.argv[0]), tsv))
     print("Took %.0fs." % (time.time() - t0))
 
     # keep 30 days of logs
