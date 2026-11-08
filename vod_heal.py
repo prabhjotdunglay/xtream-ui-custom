@@ -44,6 +44,7 @@ import collections
 import datetime
 import fcntl
 import glob
+import json
 import os
 import random
 import re
@@ -51,7 +52,51 @@ import sys
 import time
 import unicodedata
 
-VERSION = "2026-11-08-L (mirror-from B, no-drive orphan removal, drive speed check, folder-delay, ctrl-c, progress heartbeat, fast cleanup lookups, include-working, undo-orphans, panel-ids/orphans, cleanup export, remove-links, trial, find-gone, peek, auto-pick, panel-info, decisions)"
+VERSION = "2026-11-08-M (update-source SQL, mirror-from B, no-drive orphan removal, drive speed check, folder-delay, ctrl-c, progress heartbeat, fast cleanup lookups, include-working, undo-orphans, panel-ids/orphans, cleanup export, remove-links, trial, find-gone, peek, auto-pick, panel-info, decisions)"
+
+def sql_lit(s):
+    """MySQL string literal body (default sql_mode: backslash is an escape character)."""
+    return s.replace("\\", "\\\\").replace("'", "''")
+
+
+def source_json_body(path):
+    """The panel stores stream_source as a JSON array with '/' escaped and non-ASCII as \\uXXXX
+    (PHP json_encode). Return the string that goes between  ["s:<server>:  and  "] ."""
+    return json.dumps(path, ensure_ascii=True)[1:-1].replace("/", "\\/")
+
+
+def write_source_sql(log_dir, stamp, updates):
+    """Write source_updates_<stamp>.sql and source_undo_<stamp>.sql.
+
+    stream_source looks like  ["s:9:\\/mnt\\/unionfs\\/Media\\/...mkv"]  - 9 is the SERVER ID (keep it).
+    Only rows that are exactly one such entry are touched; the server prefix is read from the row itself."""
+    bk = "streams_source_bk_%s" % stamp
+    up = os.path.join(log_dir, "source_updates_%s.sql" % stamp)
+    un = os.path.join(log_dir, "source_undo_%s.sql" % stamp)
+    ids = sorted(updates, key=int)
+    with open(up, "w", encoding="utf-8") as f:
+        f.write("-- Run on the PANEL DATABASE (xtream_iptvpro) that owns these stream ids - not on the LB.\n")
+        f.write("-- Cosmetic: changes the 'Movie Path / URL' shown in admin. Playback does not use it.\n")
+        f.write("-- Old values are saved in table %s first. Undo: source_undo_%s.sql\n" % (bk, stamp))
+        f.write("CREATE TABLE `%s` (`id` INT NOT NULL PRIMARY KEY, `stream_source` MEDIUMTEXT);\n" % bk)
+        for i in range(0, len(ids), 500):
+            chunk = ids[i:i + 500]
+            f.write("INSERT INTO `%s` SELECT `id`, `stream_source` FROM `streams` WHERE `id` IN (%s);\n"
+                    % (bk, ",".join(chunk)))
+        f.write("-- keep the s:<server>: prefix of each row; only single-entry rows of type movie/episode\n")
+        for i in ids:
+            body = sql_lit(source_json_body(updates[i]))
+            f.write("UPDATE `streams` SET `stream_source` = CONCAT(LEFT(`stream_source`, "
+                    "LOCATE(':', `stream_source`, LOCATE(':', `stream_source`) + 1)), '%s\"]') "
+                    "WHERE `id` = %s AND `type` IN (2,5) AND `stream_source` LIKE '[\"s:%%:%%\"]' "
+                    "AND `stream_source` NOT REGEXP '\"[ ]*,[ ]*\"';\n" % (body, i))
+        f.write("SELECT ROW_COUNT() AS 'last_row_changed';\n")
+    with open(un, "w", encoding="utf-8") as f:
+        f.write("-- Restores 'Movie Path / URL' to the values saved by source_updates_%s.sql\n" % stamp)
+        f.write("UPDATE `streams` s JOIN `%s` b ON b.`id` = s.`id` SET s.`stream_source` = b.`stream_source`;\n" % bk)
+        f.write("-- when happy you may drop the backup:  DROP TABLE `%s`;\n" % bk)
+    return up
+
 
 VIDEO_EXT = {".mkv", ".mp4", ".avi", ".m4v", ".mov", ".ts", ".wmv", ".mpg", ".mpeg", ".webm"}
 JUNK_RE = re.compile(r"(?i)(^|[\W_])(sample|trailer|featurette|extras?|behind[\W_]the[\W_]scenes|deleted[\W_]scenes)([\W_]|$)")
@@ -1266,6 +1311,10 @@ def main():
     ap.add_argument("--skip-ext-change", action="store_true",
                     help="leave links alone when the replacement file has a different extension "
                          "(e.g. .avi -> .mkv); they are listed for manual handling")
+    ap.add_argument("--update-source", action="store_true",
+                    help="also write source_updates_*.sql (+ an undo file) that sets the 'Movie Path / URL' "
+                         "shown in the admin panel (streams.stream_source) to each repaired file. Cosmetic: "
+                         "playback uses the link, not this field. Run the SQL on the panel's main DB")
     ap.add_argument("--add-ext-link", action="store_true", help=argparse.SUPPRESS)  # now the default
     ap.add_argument("--no-ext-link", action="store_true",
                     help="when the extension differs (e.g. .avi -> .mkv) do NOT also create <id>.<newext> "
@@ -1509,6 +1558,7 @@ def main():
     # --- 2) resolve (and optionally apply) ---
     rows, fixed, unresolved, ext_mismatch, skipped_ext = [], 0, 0, 0, 0
     ext_ids = {}            # new extension -> [stream ids] for the target_container SQL
+    src_updates = {}        # stream id -> new file path, for the optional stream_source SQL
     skip = set()
     if a.skip_ids:
         raw = open(a.skip_ids).read() if os.path.isfile(a.skip_ids) else a.skip_ids
@@ -1571,6 +1621,8 @@ def main():
                 continue
         fixed += 1
         rows.append((status, link, old, new, " ".join(x for x in (note, flag) if x)))
+        if p_["id"]:
+            src_updates[p_["id"]] = new
         if ext_differs and a.add_ext_link:
             m_id = re.match(r"^(\d+)\.", name)
             if m_id:
@@ -1612,6 +1664,10 @@ def main():
                     chunk = idl[i:i + 1000]
                     f.write("UPDATE `streams` SET `target_container` = '[\"%s\"]' WHERE `id` IN (%s);\n"
                             % (ext, ",".join(chunk)))
+
+    srcfile = ""
+    if a.update_source and src_updates and a.apply:
+        srcfile = write_source_sql(a.log_dir, stamp, src_updates)
 
     # ---- the "needs your attention" list, in plain English ----
     attn = [r for r in rows if r[0] in ("UNRESOLVED", "ERROR", "SKIPPED_ID", "SKIPPED_EXT")]
@@ -1736,6 +1792,10 @@ def main():
     print("  heal_%s.tsv              <- every link and what happened (also used for --undo)" % stamp)
     if sqlfile:
         print("  %s  <- run on the PANEL database after applying" % os.path.basename(sqlfile))
+    if srcfile:
+        print("  %s  <- (optional) updates 'Movie Path / URL' in admin; run on the PANEL database;" %
+              os.path.basename(srcfile))
+        print("      it backs up the old values first; undo with source_undo_%s.sql" % stamp)
     if trial_info:
         trial_file = os.path.join(a.log_dir, "trial_%s.tsv" % stamp)
         with open(trial_file, "w", encoding="utf-8") as fh:
