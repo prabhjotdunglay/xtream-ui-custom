@@ -51,7 +51,7 @@ import sys
 import time
 import unicodedata
 
-VERSION = "2026-11-08-K (drive speed check, folder-delay, ctrl-c, progress heartbeat, fast cleanup lookups, include-working, undo-orphans, panel-ids/orphans, cleanup export, remove-links, trial, find-gone, peek, auto-pick, panel-info, decisions)"
+VERSION = "2026-11-08-L (mirror-from B, no-drive orphan removal, drive speed check, folder-delay, ctrl-c, progress heartbeat, fast cleanup lookups, include-working, undo-orphans, panel-ids/orphans, cleanup export, remove-links, trial, find-gone, peek, auto-pick, panel-info, decisions)"
 
 VIDEO_EXT = {".mkv", ".mp4", ".avi", ".m4v", ".mov", ".ts", ".wmv", ".mpg", ".mpeg", ".webm"}
 JUNK_RE = re.compile(r"(?i)(^|[\W_])(sample|trailer|featurette|extras?|behind[\W_]the[\W_]scenes|deleted[\W_]scenes)([\W_]|$)")
@@ -551,6 +551,8 @@ def load_decisions(path):
 def explain(note):
     """Machine reason -> a sentence a person can act on."""
     n = note or ""
+    if n.startswith("mirror:"):
+        return "B's replacement file cannot be seen from this server - check the drive mount"
     if n.startswith("marked-gone-by-you"):
         return "You marked this title as gone (ids are in gone_ids_*.txt for cleanup)"
     if n.startswith("skipped-by-you"):
@@ -993,20 +995,24 @@ def cmd_remove_links(a):
     return 0
 
 
-def preflight_speed(a):
+def preflight_speed(a, only_parents=None):
     """Before the real scan: read where every link points (local, fast), then time a handful of folder
-    listings on the drive. If the drive is slow (cold rclone cache), say so instead of hanging for hours."""
+    listings on the drive. If the drive is slow (cold rclone cache), say so instead of hanging for hours.
+    only_parents: just these folders will be touched (mirror mode), so estimate for those only."""
     t0 = time.time()
     parents = collections.Counter()
-    for e in os.scandir(a.movies_dir):
-        try:
-            if e.is_symlink():
-                t = os.readlink(e.path)
-                if not os.path.isabs(t):
-                    t = os.path.normpath(os.path.join(a.movies_dir, t))
-                parents[os.path.dirname(t)] += 1
-        except OSError:
-            pass
+    if only_parents is not None:
+        parents.update(only_parents)
+    else:
+        for e in os.scandir(a.movies_dir):
+            try:
+                if e.is_symlink():
+                    t = os.readlink(e.path)
+                    if not os.path.isabs(t):
+                        t = os.path.normpath(os.path.join(a.movies_dir, t))
+                    parents[os.path.dirname(t)] += 1
+            except OSError:
+                pass
     if not parents:
         return
     sample = random.sample(list(parents), min(8, len(parents)))
@@ -1043,6 +1049,141 @@ def preflight_speed(a):
     print("  2. Or run it normally right now:   ... vod_heal.py --ignore-slow")
     print("  3. Or ask rclone to fill its cache in the background first (see the instructions).")
     sys.exit(2)
+
+
+def load_mirror(path, offset):
+    """B's current links (find ... -printf '%p\\t%l\\n' run on B's LB) -> {A's link name: B's target}.
+    B's id + offset = A's id; the extension is kept."""
+    m = {}
+    with open(path, "r", encoding="utf-8", errors="replace") as f:
+        for line in f:
+            line = line.rstrip("\n")
+            if "\t" not in line:
+                continue
+            p_, t_ = line.split("\t", 1)
+            mm = re.match(r"^(\d+)\.(.+)$", os.path.basename(p_))
+            if mm:
+                m["%d.%s" % (int(mm.group(1)) + offset, mm.group(2))] = t_
+    return m
+
+
+def mirror_scan(a, healer, mirror, panel_ids):
+    """Compare THIS server's links with B's. Only links whose target differs from B's are checked against the
+    drive. Returns (total, ok_count, broken, healthy, orphans, mirror_new, info) or an int exit code."""
+    links = same = no_b = orph = 0
+    cands, healthy = [], {}
+    for e in os.scandir(a.movies_dir):
+        try:
+            if not e.is_symlink():
+                continue
+            links += 1
+            m_ = re.match(r"^(\d+)\.", e.name)
+            a_t = os.readlink(e.path)
+            if not os.path.isabs(a_t):
+                a_t = os.path.normpath(os.path.join(a.movies_dir, a_t))
+            if panel_ids is not None and m_ and m_.group(1) not in panel_ids:
+                orph += 1
+                continue
+            b_t = mirror.get(e.name)
+            if b_t is None:
+                no_b += 1
+                continue
+            if a_t == b_t:
+                same += 1
+                healthy[e.path] = a_t
+                continue
+            cands.append((e.path, a_t, b_t))
+        except OSError:
+            pass
+    compared = same + len(cands)
+    real = links - orph
+    if real > 0 and compared < 0.5 * real:
+        print("")
+        print("STOPPED, nothing was changed: only %d of this server's %d links have a matching link in B's file." % (compared, real))
+        print("The offset is probably wrong (this panel's ids should be B's ids + %d), or the file is not B's." % a.mirror_offset)
+        return 2
+    print("compared with B: %d links match B exactly, %d differ, %d have no counterpart on B, %d are leftovers"
+          % (same, len(cands), no_b, orph), flush=True)
+    healer.cache.t0 = time.time()
+    if cands:
+        parents = set(os.path.dirname(x[1]) for x in cands) | set(os.path.dirname(x[2]) for x in cands)
+        preflight_speed(a, only_parents=parents)
+        sample = random.sample(cands, min(60, len(cands)))
+        seen_ok = sum(1 for x in sample if healer.target_exists(x[2]))
+        if seen_ok < 0.8 * len(sample):
+            print("")
+            print("STOPPED, nothing was changed: only %d of %d of B's replacement files can be seen from this server." % (seen_ok, len(sample)))
+            print("This server's drive mount does not look the same as B's. Check the mount before mirroring.")
+            return 2
+    broken, mirror_new, alive = [], {}, 0
+    for link, a_t, b_t in cands:
+        if healer.target_exists(a_t):
+            alive += 1
+            healthy[link] = a_t                     # this server's own link works: leave it alone
+            continue
+        broken.append((link, a_t))
+        if healer.target_exists(b_t):
+            mirror_new[link] = (b_t, "mirrored-from-B")
+    info = {"links": links, "same": same, "differ": len(cands), "no_b": no_b, "orph": orph, "alive": alive}
+    return compared, same + alive, broken, healthy, [], mirror_new, info
+
+
+def remove_orphans_nodrive(a, panel_ids):
+    """Leftover links belong to titles that are not in the panel: nobody can reach them, whether or not they
+    still point at a file. So removing them does not need the drive at all."""
+    if not a.include_working:
+        print("--no-drive cannot tell dead leftovers from working ones, so it removes all of them: add --include-working.")
+        return 1
+    if not os.path.isdir(a.movies_dir):
+        print("movies dir %s not found (run this on the LB)." % a.movies_dir)
+        return 3
+    real, leftovers, young = 0, [], 0
+    for e in os.scandir(a.movies_dir):
+        try:
+            if not e.is_symlink():
+                continue
+            m_ = re.match(r"^(\d+)\.", e.name)
+            if m_ and m_.group(1) not in panel_ids:
+                age = (time.time() - e.stat(follow_symlinks=False).st_mtime) / 86400.0
+                if age < a.orphan_min_age_days:
+                    young += 1
+                else:
+                    leftovers.append((e.path, os.readlink(e.path)))
+            else:
+                real += 1
+        except OSError:
+            pass
+    tot = real + len(leftovers) + young
+    ids_age = (time.time() - os.path.getmtime(a.panel_ids)) / 86400.0
+    print("")
+    print("LEFTOVER LINKS (title no longer in the panel), drive not touched:")
+    print("  links of real titles (kept) ..... %d" % real)
+    print("  leftovers to remove ............. %d" % len(leftovers))
+    print("  too new to judge (kept) ......... %d" % young)
+    print("  panel-ids file age .............. %.1f days" % ids_age)
+    if tot and 100.0 * (len(leftovers) + young) / tot > 60.0:
+        print("STOPPED, nothing was changed: over 60%% of the links are not in the --panel-ids file - wrong panel's file?")
+        return 2
+    if ids_age > 2.0 and not a.force:
+        print("STOPPED, nothing removed: the ids file is %.1f days old. Export it again and run this the same day." % ids_age)
+        return 2
+    if not a.apply:
+        print("DRY RUN - nothing removed. Add --apply to remove the %d leftovers." % len(leftovers))
+        return 0
+    os.makedirs(a.log_dir, exist_ok=True)
+    logo = os.path.join(a.log_dir, "removed_orphans_%s.tsv" % datetime.datetime.now().strftime("%Y%m%d_%H%M%S"))
+    n = 0
+    with open(logo, "w", encoding="utf-8") as fh:
+        for link_, t_ in leftovers:
+            try:
+                os.unlink(link_)
+                fh.write("%s\t%s\n" % (link_, t_))
+                n += 1
+            except OSError:
+                pass
+    print("removed %d leftover links. Log: %s" % (n, logo))
+    print("To put them back:  python3 %s --undo-orphans %s" % (os.path.abspath(sys.argv[0]), logo))
+    return 0
 
 
 def run():
@@ -1100,6 +1241,15 @@ def main():
     ap.add_argument("--remove-orphans", action="store_true",
                     help="with --panel-ids: remove the DEAD leftover links (dry run unless --apply). Working "
                          "leftovers and links younger than --orphan-min-age-days are kept")
+    ap.add_argument("--mirror-from", metavar="FILE",
+                    help="B's current links (made on B's LB with: find <movies dir> -type l -printf '%%p\\t%%l\\n'). "
+                         "This server's links are compared with B's and only the ones B changed are repaired - the "
+                         "drive is checked only for those, not for every link")
+    ap.add_argument("--mirror-offset", type=int, default=1000000,
+                    help="this panel's ids = B's ids + this (default 1000000)")
+    ap.add_argument("--no-drive", action="store_true",
+                    help="with --remove-orphans --include-working: do not look at the drive at all (leftovers are "
+                         "unreachable whether or not their file exists)")
     ap.add_argument("--include-working", action="store_true",
                     help="with --remove-orphans: ALSO remove leftover links that still point at a file (nobody can reach "
                          "them: their title is not in the panel). Needs a panel-ids file made in the last 2 days")
@@ -1229,51 +1379,75 @@ def main():
     if a.remove_orphans and panel_ids is None:
         print("--remove-orphans needs --panel-ids")
         return 1
-    preflight_speed(a)
+    if a.remove_orphans and a.no_drive:
+        return remove_orphans_nodrive(a, panel_ids)
+    mirror = None
+    if a.mirror_from:
+        if a.remove_orphans:
+            print("Use --mirror-from and --remove-orphans in separate runs.")
+            return 1
+        try:
+            mirror = load_mirror(a.mirror_from, a.mirror_offset)
+        except OSError as e:
+            print("cannot read --mirror-from file: %s" % e)
+            return 1
+        if len(mirror) < 1000:
+            print("STOPPED: the --mirror-from file has only %d links - that is not a real export." % len(mirror))
+            return 1
+        print("B's links loaded: %d (ids shifted by +%d)" % (len(mirror), a.mirror_offset))
     healer = Healer(roots, a.index_depth, not a.no_auto_pick, a.allow_title_only, decisions, panel_year, a.folder_delay)
     total = ok_count = 0
     broken = []
     orphans = []          # (link, target, alive, age_days) for links whose id is not a title in the panel
     healthy = {}          # link -> target for links that work now; re-checked after --apply
     io_errors = 0
-    print("Checking every link against the drive. Each folder is listed once; on a COLD rclone cache this can")
-    print("take several minutes the first time (it only reads folder names, no video data). Later runs take seconds.")
-    t_scan, last_beat = time.time(), time.time()
-    for e in os.scandir(a.movies_dir):
-        if time.time() - last_beat >= 15:
-            last_beat = time.time()
-            print("  ...still working: %d links checked, %d folders listed, %d seconds so far"
-                  % (total + len(orphans), len(healer.cache.d), last_beat - t_scan))
-        try:
-            if not e.is_symlink():
-                continue
-            if panel_ids is not None:
-                m_ = re.match(r"^(\d+)\.", e.name)
-                if m_ and m_.group(1) not in panel_ids:
-                    t_ = os.readlink(e.path)
-                    if not os.path.isabs(t_):
-                        t_ = os.path.normpath(os.path.join(a.movies_dir, t_))
-                    try:
-                        age_ = (time.time() - e.stat(follow_symlinks=False).st_mtime) / 86400.0
-                    except OSError:
-                        age_ = 9999.0
-                    orphans.append((e.path, t_, healer.target_exists(t_), age_))
+    mirror_new = None
+    mirror_info = None
+    if mirror is not None:
+        r_ = mirror_scan(a, healer, mirror, panel_ids)
+        if isinstance(r_, int):
+            return r_
+        total, ok_count, broken, healthy, orphans, mirror_new, mirror_info = r_
+    else:
+        preflight_speed(a)
+        print("Checking every link against the drive. Each folder is listed once; on a COLD rclone cache this can")
+        print("take several minutes the first time (it only reads folder names, no video data). Later runs take seconds.")
+        t_scan, last_beat = time.time(), time.time()
+        for e in os.scandir(a.movies_dir):
+            if time.time() - last_beat >= 15:
+                last_beat = time.time()
+                print("  ...still working: %d links checked, %d folders listed, %d seconds so far"
+                      % (total + len(orphans), len(healer.cache.d), last_beat - t_scan))
+            try:
+                if not e.is_symlink():
                     continue
-            total += 1
-            target = os.readlink(e.path)
-            if not os.path.isabs(target):
-                target = os.path.normpath(os.path.join(a.movies_dir, target))
-            if healer.target_exists(target):
-                ok_count += 1
-                healthy[e.path] = target
-            else:
-                broken.append((e.path, target))
-        except OSError:
-            io_errors += 1
-        if total and total % 50000 == 0:
-            print("  scanned %d links..." % total)
-        if a.limit and total >= a.limit:
-            break
+                if panel_ids is not None:
+                    m_ = re.match(r"^(\d+)\.", e.name)
+                    if m_ and m_.group(1) not in panel_ids:
+                        t_ = os.readlink(e.path)
+                        if not os.path.isabs(t_):
+                            t_ = os.path.normpath(os.path.join(a.movies_dir, t_))
+                        try:
+                            age_ = (time.time() - e.stat(follow_symlinks=False).st_mtime) / 86400.0
+                        except OSError:
+                            age_ = 9999.0
+                        orphans.append((e.path, t_, healer.target_exists(t_), age_))
+                        continue
+                total += 1
+                target = os.readlink(e.path)
+                if not os.path.isabs(target):
+                    target = os.path.normpath(os.path.join(a.movies_dir, target))
+                if healer.target_exists(target):
+                    ok_count += 1
+                    healthy[e.path] = target
+                else:
+                    broken.append((e.path, target))
+            except OSError:
+                io_errors += 1
+            if total and total % 50000 == 0:
+                print("  scanned %d links..." % total)
+            if a.limit and total >= a.limit:
+                break
 
     if panel_ids is not None and (total + len(orphans)) > 0:
         share = 100.0 * len(orphans) / (total + len(orphans))
@@ -1351,7 +1525,10 @@ def main():
             rows.append(("SKIPPED_ID", link, old, "", "in --skip-ids"))
             continue
         try:
-            new, note = healer.resolve(old, mid.group(1) if mid else None)
+            if mirror_new is not None:
+                new, note = mirror_new.get(link, (None, "mirror: B's replacement file is not visible from this server"))
+            else:
+                new, note = healer.resolve(old, mid.group(1) if mid else None)
         except OSError as ex:
             rows.append(("ERROR", link, old, "", "io-error: %s" % ex))
             unresolved += 1
@@ -1517,7 +1694,15 @@ def main():
     print("VOD HEAL SUMMARY  " + ("(DRY RUN - nothing was changed)" if not a.apply else "(APPLIED)"))
     print("script version: " + VERSION)
     print("=" * W)
-    if panel_ids is not None:
+    if mirror_info:
+        print("MIRROR OF B  (only the links B changed were checked against the drive)")
+        print("  Links on this server ........ %d   (%d leftovers ignored, %d with no counterpart on B)"
+              % (mirror_info["links"], mirror_info["orph"], mirror_info["no_b"]))
+        print("  Same as B ................... %d   (assumed working, like B)" % mirror_info["same"])
+        print("  Different from B ............ %d   (%d already work here and are left alone)"
+              % (mirror_info["differ"], mirror_info["alive"]))
+        print("Links compared with B ......... %d" % total)
+    elif panel_ids is not None:
         print("All links on this LB ......... %d" % (total + len(orphans)))
         print("  LEFTOVER (title deleted) ... %d   <- not in the panel; ignored. %d dead, %d still point at a file"
               % (len(orphans), sum(1 for o in orphans if not o[2]), sum(1 for o in orphans if o[2])))
