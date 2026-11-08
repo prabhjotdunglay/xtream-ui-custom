@@ -51,7 +51,7 @@ import sys
 import time
 import unicodedata
 
-VERSION = "2026-11-08-G (panel-ids/orphans, cleanup export, remove-links, trial, find-gone, peek, auto-pick, panel-info, decisions)"
+VERSION = "2026-11-08-H (include-working, undo-orphans, panel-ids/orphans, cleanup export, remove-links, trial, find-gone, peek, auto-pick, panel-info, decisions)"
 
 VIDEO_EXT = {".mkv", ".mp4", ".avi", ".m4v", ".mov", ".ts", ".wmv", ".mpg", ".mpeg", ".webm"}
 JUNK_RE = re.compile(r"(?i)(^|[\W_])(sample|trailer|featurette|extras?|behind[\W_]the[\W_]scenes|deleted[\W_]scenes)([\W_]|$)")
@@ -1015,6 +1015,11 @@ def main():
     ap.add_argument("--remove-orphans", action="store_true",
                     help="with --panel-ids: remove the DEAD leftover links (dry run unless --apply). Working "
                          "leftovers and links younger than --orphan-min-age-days are kept")
+    ap.add_argument("--include-working", action="store_true",
+                    help="with --remove-orphans: ALSO remove leftover links that still point at a file (nobody can reach "
+                         "them: their title is not in the panel). Needs a panel-ids file made in the last 2 days")
+    ap.add_argument("--undo-orphans", metavar="LOGFILE",
+                    help="recreate the leftover links listed in a removed_orphans_*.tsv log")
     ap.add_argument("--orphan-min-age-days", type=float, default=3.0,
                     help="never treat a link newer than this as a leftover (a title just added may not be in an old ids file)")
     ap.add_argument("--skip-ids", metavar="FILE_OR_LIST",
@@ -1041,6 +1046,18 @@ def main():
 
     if a.undo:
         do_undo(a.undo)
+        return 0
+    if a.undo_orphans:
+        n = bad = 0
+        for line in open(a.undo_orphans, encoding="utf-8", errors="replace"):
+            c = line.rstrip("\n").split("\t")
+            if len(c) >= 2 and not os.path.lexists(c[0]):
+                try:
+                    os.symlink(c[1], c[0])
+                    n += 1
+                except OSError:
+                    bad += 1
+        print("recreated %d links (%d could not be recreated) from %s" % (n, bad, a.undo_orphans))
         return 0
     if a.find_gone:
         return cmd_find_gone(a)
@@ -1167,30 +1184,41 @@ def main():
             print("or is out of date. Export the ids again from THIS LB's own main server.")
             return 2
     if a.remove_orphans:
-        dead = [o for o in orphans if not o[2] and o[3] >= a.orphan_min_age_days]
-        young = [o for o in orphans if not o[2] and o[3] < a.orphan_min_age_days]
-        alive_o = [o for o in orphans if o[2]]
+        old_enough = [o for o in orphans if o[3] >= a.orphan_min_age_days]
+        young = [o for o in orphans if o[3] < a.orphan_min_age_days]
+        dead = [o for o in old_enough if not o[2]]
+        alive_o = [o for o in old_enough if o[2]]
+        to_remove = dead + (alive_o if a.include_working else [])
+        ids_age = (time.time() - os.path.getmtime(a.panel_ids)) / 86400.0
         print("")
         print("LEFTOVER LINKS (title no longer in the panel): %d" % len(orphans))
-        print("  dead, safe to remove ............ %d" % len(dead))
-        print("  still point at a file (kept) .... %d" % len(alive_o))
-        print("  too new to judge (kept) ......... %d" % len(young))
+        print("  dead (point at nothing) ......... %d   -> %s" % (len(dead), "will be removed"))
+        print("  still point at a file ........... %d   -> %s" % (len(alive_o),
+              "will be removed (--include-working)" if a.include_working else "kept (add --include-working to remove)"))
+        print("  too new to judge ................ %d   -> kept" % len(young))
+        print("  panel-ids file age .............. %.1f days" % ids_age)
+        if a.include_working and ids_age > 2.0 and not a.force:
+            print("")
+            print("STOPPED, nothing removed: the ids file is %.1f days old. A title added since then would look like a" % ids_age)
+            print("leftover. Export the ids again (SELECT id FROM streams WHERE type IN (2,5)) and run this the same day.")
+            return 2
         if not a.apply:
-            print("DRY RUN - nothing removed. Add --apply to remove the %d dead leftovers." % len(dead))
+            print("DRY RUN - nothing removed. Add --apply to remove the %d links marked 'will be removed'." % len(to_remove))
             return 0
         os.makedirs(a.log_dir, exist_ok=True)
         stamp_o = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
         logo = os.path.join(a.log_dir, "removed_orphans_%s.tsv" % stamp_o)
         n_o = 0
         with open(logo, "w", encoding="utf-8") as fh:
-            for link_, t_, _, _ in dead:
+            for link_, t_, _, _ in to_remove:
                 try:
                     os.unlink(link_)
                     fh.write("%s\t%s\n" % (link_, t_))
                     n_o += 1
                 except OSError:
                     pass
-        print("removed %d dead leftover links. Log: %s" % (n_o, logo))
+        print("removed %d leftover links. Log: %s" % (n_o, logo))
+        print("To put them back:  python3 %s --undo-orphans %s" % (os.path.abspath(sys.argv[0]), logo))
         return 0
     pct = (100.0 * len(broken) / total) if total else 0.0
     if io_errors:
