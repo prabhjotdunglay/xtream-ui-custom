@@ -51,7 +51,7 @@ import sys
 import time
 import unicodedata
 
-VERSION = "2026-11-08-I (fast cleanup lookups, include-working, undo-orphans, panel-ids/orphans, cleanup export, remove-links, trial, find-gone, peek, auto-pick, panel-info, decisions)"
+VERSION = "2026-11-08-K (drive speed check, folder-delay, ctrl-c, progress heartbeat, fast cleanup lookups, include-working, undo-orphans, panel-ids/orphans, cleanup export, remove-links, trial, find-gone, peek, auto-pick, panel-info, decisions)"
 
 VIDEO_EXT = {".mkv", ".mp4", ".avi", ".m4v", ".mov", ".ts", ".wmv", ".mpg", ".mpeg", ".webm"}
 JUNK_RE = re.compile(r"(?i)(^|[\W_])(sample|trailer|featurette|extras?|behind[\W_]the[\W_]scenes|deleted[\W_]scenes)([\W_]|$)")
@@ -161,22 +161,34 @@ def first_episode(filename):
     return (int(m.group(1)), int(m.group(2))) if m else None
 
 
+PROGRESS_EVERY = 5000
+
+
 class DirCache(object):
     """Directory listings, each fetched at most once. None means 'directory does not exist'.
     Any other OSError (I/O error, mount trouble) propagates so the caller can count it."""
 
-    def __init__(self):
+    def __init__(self, delay=0.0):
         self.d = {}
+        self.delay = delay            # seconds to pause after a folder that was slow to list (be gentle on the drive)
+        self.n = 0
+        self.t0 = time.time()
 
     def names(self, path):
         if path in self.d:
             return self.d[path]
+        t = time.time()
         try:
             with os.scandir(path) as it:
                 v = set(e.name for e in it)
         except (FileNotFoundError, NotADirectoryError):
             v = None
         self.d[path] = v
+        self.n += 1
+        if self.delay and (time.time() - t) > 0.05:
+            time.sleep(self.delay)
+        if self.n % PROGRESS_EVERY == 0:
+            print("  ...looked in %d folders so far (%.0f s elapsed)" % (self.n, time.time() - self.t0), flush=True)
         return v
 
 
@@ -249,8 +261,8 @@ def common_depth(a, b):
 
 
 class Healer(object):
-    def __init__(self, roots, depth, auto_pick=True, allow_title_only=False, decisions=None, panel_year=None):
-        self.cache = DirCache()
+    def __init__(self, roots, depth, auto_pick=True, allow_title_only=False, decisions=None, panel_year=None, folder_delay=0.0):
+        self.cache = DirCache(folder_delay)
         self.index = Index(roots, depth)
         self.auto_pick = auto_pick
         self.panel_year = panel_year or {}    # stream id -> release year the PANEL has for it
@@ -981,6 +993,66 @@ def cmd_remove_links(a):
     return 0
 
 
+def preflight_speed(a):
+    """Before the real scan: read where every link points (local, fast), then time a handful of folder
+    listings on the drive. If the drive is slow (cold rclone cache), say so instead of hanging for hours."""
+    t0 = time.time()
+    parents = collections.Counter()
+    for e in os.scandir(a.movies_dir):
+        try:
+            if e.is_symlink():
+                t = os.readlink(e.path)
+                if not os.path.isabs(t):
+                    t = os.path.normpath(os.path.join(a.movies_dir, t))
+                parents[os.path.dirname(t)] += 1
+        except OSError:
+            pass
+    if not parents:
+        return
+    sample = random.sample(list(parents), min(8, len(parents)))
+    spent = 0.0
+    for d in sample:
+        t = time.time()
+        try:
+            with os.scandir(d) as it:
+                for _ in it:
+                    pass
+        except OSError:
+            pass
+        spent += time.time() - t
+    each = spent / len(sample)
+    est = each * len(parents)
+    print("drive speed test: %d sample folders in %.1fs (%.2fs each). The links point into %d folders."
+          % (len(sample), spent, each, len(parents)), flush=True)
+    if est <= a.max_scan_minutes * 60 or a.ignore_slow:
+        if est > 120:
+            print("  at this speed the scan could take about %.0f minutes." % (est / 60.0), flush=True)
+        return
+    mins = est / 60.0
+    print("")
+    print("STOPPED, nothing was changed.")
+    print("The drive is answering slowly right now. Checking every link would take about %s" %
+          ("%.0f hours" % (mins / 60.0) if mins > 120 else "%.0f minutes" % mins))
+    print("and send about %d folder requests to Google Drive while people are watching." % len(parents))
+    print("Most likely this server's rclone folder cache is empty (cold): it has not listed these folders yet.")
+    print("")
+    print("What you can do:")
+    print("  1. Run it at a quiet time, gently, so viewers are not slowed down. Folders already listed stay")
+    print("     cached, so you can stop (Ctrl+C) and run it again to continue:")
+    print("        ... vod_heal.py --ignore-slow --folder-delay 0.1")
+    print("  2. Or run it normally right now:   ... vod_heal.py --ignore-slow")
+    print("  3. Or ask rclone to fill its cache in the background first (see the instructions).")
+    sys.exit(2)
+
+
+def run():
+    try:
+        return main()
+    except KeyboardInterrupt:
+        print("\nStopped by you. Nothing was changed.")
+        return 130
+
+
 def main():
     ap = argparse.ArgumentParser(description="Repair VOD symlinks broken by Radarr/Sonarr upgrades.")
     ap.add_argument("--version", action="version", version="vod_heal " + VERSION)
@@ -1048,6 +1120,13 @@ def main():
     ap.add_argument("--no-ext-link", action="store_true",
                     help="when the extension differs (e.g. .avi -> .mkv) do NOT also create <id>.<newext> "
                          "and the ext_updates_*.sql file (the old-name link is still repointed)")
+    ap.add_argument("--max-scan-minutes", type=float, default=15.0,
+                    help="stop before scanning if the drive is so slow that checking every link would take longer "
+                         "than this (default 15). A cold rclone cache makes the first scan very slow")
+    ap.add_argument("--ignore-slow", action="store_true", help="scan anyway, even if the drive looks slow")
+    ap.add_argument("--folder-delay", type=float, default=0.0, metavar="SECONDS",
+                    help="pause this long after each folder the drive was slow to list (e.g. 0.1). Gentler on "
+                         "viewers during the day. Folders already listed stay cached, so you can stop and continue")
     ap.add_argument("--max-broken-pct", type=float, default=10.0,
                     help="refuse to apply if more than this %% of links look broken (dead-mount guard)")
     ap.add_argument("--force", action="store_true", help="override the dead-mount guard")
@@ -1150,13 +1229,21 @@ def main():
     if a.remove_orphans and panel_ids is None:
         print("--remove-orphans needs --panel-ids")
         return 1
-    healer = Healer(roots, a.index_depth, not a.no_auto_pick, a.allow_title_only, decisions, panel_year)
+    preflight_speed(a)
+    healer = Healer(roots, a.index_depth, not a.no_auto_pick, a.allow_title_only, decisions, panel_year, a.folder_delay)
     total = ok_count = 0
     broken = []
     orphans = []          # (link, target, alive, age_days) for links whose id is not a title in the panel
     healthy = {}          # link -> target for links that work now; re-checked after --apply
     io_errors = 0
+    print("Checking every link against the drive. Each folder is listed once; on a COLD rclone cache this can")
+    print("take several minutes the first time (it only reads folder names, no video data). Later runs take seconds.")
+    t_scan, last_beat = time.time(), time.time()
     for e in os.scandir(a.movies_dir):
+        if time.time() - last_beat >= 15:
+            last_beat = time.time()
+            print("  ...still working: %d links checked, %d folders listed, %d seconds so far"
+                  % (total + len(orphans), len(healer.cache.d), last_beat - t_scan))
         try:
             if not e.is_symlink():
                 continue
@@ -1499,4 +1586,4 @@ def main():
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    sys.exit(run())
