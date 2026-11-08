@@ -51,7 +51,7 @@ import sys
 import time
 import unicodedata
 
-VERSION = "2026-11-08-F (cleanup export, remove-links, trial, find-gone, peek, auto-pick-2160p, panel-info, decisions)"
+VERSION = "2026-11-08-G (panel-ids/orphans, cleanup export, remove-links, trial, find-gone, peek, auto-pick, panel-info, decisions)"
 
 VIDEO_EXT = {".mkv", ".mp4", ".avi", ".m4v", ".mov", ".ts", ".wmv", ".mpg", ".mpeg", ".webm"}
 JUNK_RE = re.compile(r"(?i)(^|[\W_])(sample|trailer|featurette|extras?|behind[\W_]the[\W_]scenes|deleted[\W_]scenes)([\W_]|$)")
@@ -1008,6 +1008,15 @@ def main():
                          "which N it would pick")
     ap.add_argument("--only-ids", metavar="FILE_OR_LIST",
                     help="repair only these stream ids (a file, or comma-separated)")
+    ap.add_argument("--panel-ids", metavar="FILE",
+                    help="optional: every movie/episode id the PANEL really has (one per line, from the database: "
+                         "SELECT id FROM streams WHERE type IN (2,5)). Links for ids not in it are leftovers from "
+                         "deleted titles: they are counted separately and never repaired")
+    ap.add_argument("--remove-orphans", action="store_true",
+                    help="with --panel-ids: remove the DEAD leftover links (dry run unless --apply). Working "
+                         "leftovers and links younger than --orphan-min-age-days are kept")
+    ap.add_argument("--orphan-min-age-days", type=float, default=3.0,
+                    help="never treat a link newer than this as a leftover (a title just added may not be in an old ids file)")
     ap.add_argument("--skip-ids", metavar="FILE_OR_LIST",
                     help="ids the tool must never touch: a file, or a comma-separated list "
                          "(use for any pairing you rejected on review)")
@@ -1096,15 +1105,43 @@ def main():
             print("cannot read --panel-info file: %s" % e)
             return 1
         print("panel release years loaded for %d titles" % len(panel_year))
+    panel_ids = None
+    if a.panel_ids:
+        try:
+            with open(a.panel_ids, "r", encoding="utf-8", errors="replace") as f:
+                panel_ids = set(re.findall(r"\d+", f.read()))
+        except OSError as e:
+            print("cannot read --panel-ids file: %s" % e)
+            return 1
+        if len(panel_ids) < 100:
+            print("STOPPED: the --panel-ids file has only %d ids - that is not a real export. Nothing was changed." % len(panel_ids))
+            return 1
+        print("panel ids loaded: %d titles" % len(panel_ids))
+    if a.remove_orphans and panel_ids is None:
+        print("--remove-orphans needs --panel-ids")
+        return 1
     healer = Healer(roots, a.index_depth, not a.no_auto_pick, a.allow_title_only, decisions, panel_year)
     total = ok_count = 0
     broken = []
+    orphans = []          # (link, target, alive, age_days) for links whose id is not a title in the panel
     healthy = {}          # link -> target for links that work now; re-checked after --apply
     io_errors = 0
     for e in os.scandir(a.movies_dir):
         try:
             if not e.is_symlink():
                 continue
+            if panel_ids is not None:
+                m_ = re.match(r"^(\d+)\.", e.name)
+                if m_ and m_.group(1) not in panel_ids:
+                    t_ = os.readlink(e.path)
+                    if not os.path.isabs(t_):
+                        t_ = os.path.normpath(os.path.join(a.movies_dir, t_))
+                    try:
+                        age_ = (time.time() - e.stat(follow_symlinks=False).st_mtime) / 86400.0
+                    except OSError:
+                        age_ = 9999.0
+                    orphans.append((e.path, t_, healer.target_exists(t_), age_))
+                    continue
             total += 1
             target = os.readlink(e.path)
             if not os.path.isabs(target):
@@ -1121,6 +1158,40 @@ def main():
         if a.limit and total >= a.limit:
             break
 
+    if panel_ids is not None and (total + len(orphans)) > 0:
+        share = 100.0 * len(orphans) / (total + len(orphans))
+        if share > 60.0:
+            print("")
+            print("STOPPED, nothing was changed: %.0f%% of the links on this LB are not in the --panel-ids file." % share)
+            print("That file is probably from the WRONG panel (A and B have different ids: A's are B's + 1,000,000)")
+            print("or is out of date. Export the ids again from THIS LB's own main server.")
+            return 2
+    if a.remove_orphans:
+        dead = [o for o in orphans if not o[2] and o[3] >= a.orphan_min_age_days]
+        young = [o for o in orphans if not o[2] and o[3] < a.orphan_min_age_days]
+        alive_o = [o for o in orphans if o[2]]
+        print("")
+        print("LEFTOVER LINKS (title no longer in the panel): %d" % len(orphans))
+        print("  dead, safe to remove ............ %d" % len(dead))
+        print("  still point at a file (kept) .... %d" % len(alive_o))
+        print("  too new to judge (kept) ......... %d" % len(young))
+        if not a.apply:
+            print("DRY RUN - nothing removed. Add --apply to remove the %d dead leftovers." % len(dead))
+            return 0
+        os.makedirs(a.log_dir, exist_ok=True)
+        stamp_o = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        logo = os.path.join(a.log_dir, "removed_orphans_%s.tsv" % stamp_o)
+        n_o = 0
+        with open(logo, "w", encoding="utf-8") as fh:
+            for link_, t_, _, _ in dead:
+                try:
+                    os.unlink(link_)
+                    fh.write("%s\t%s\n" % (link_, t_))
+                    n_o += 1
+                except OSError:
+                    pass
+        print("removed %d dead leftover links. Log: %s" % (n_o, logo))
+        return 0
     pct = (100.0 * len(broken) / total) if total else 0.0
     if io_errors:
         print("read errors: %d links could not be read (skipped, not counted as broken)" % io_errors)
@@ -1318,7 +1389,13 @@ def main():
     print("VOD HEAL SUMMARY  " + ("(DRY RUN - nothing was changed)" if not a.apply else "(APPLIED)"))
     print("script version: " + VERSION)
     print("=" * W)
-    print("All VOD links ................ %d" % total)
+    if panel_ids is not None:
+        print("All links on this LB ......... %d" % (total + len(orphans)))
+        print("  LEFTOVER (title deleted) ... %d   <- not in the panel; ignored. %d dead, %d still point at a file"
+              % (len(orphans), sum(1 for o in orphans if not o[2]), sum(1 for o in orphans if o[2])))
+        print("Links of REAL titles ......... %d" % total)
+    else:
+        print("All VOD links ................ %d" % total)
     print("  Working (never touched) .... %d" % ok_count)
     print("  Broken ..................... %d  (%.1f%%)" % (len(broken), pct))
     if a.apply:
