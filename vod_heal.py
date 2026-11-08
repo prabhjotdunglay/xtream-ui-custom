@@ -51,7 +51,7 @@ import sys
 import time
 import unicodedata
 
-VERSION = "2026-11-08-H (include-working, undo-orphans, panel-ids/orphans, cleanup export, remove-links, trial, find-gone, peek, auto-pick, panel-info, decisions)"
+VERSION = "2026-11-08-I (fast cleanup lookups, include-working, undo-orphans, panel-ids/orphans, cleanup export, remove-links, trial, find-gone, peek, auto-pick, panel-info, decisions)"
 
 VIDEO_EXT = {".mkv", ".mp4", ".avi", ".m4v", ".mov", ".ts", ".wmv", ".mpg", ".mpeg", ".webm"}
 JUNK_RE = re.compile(r"(?i)(^|[\W_])(sample|trailer|featurette|extras?|behind[\W_]the[\W_]scenes|deleted[\W_]scenes)([\W_]|$)")
@@ -858,6 +858,17 @@ CLEANUP_CATEGORIES = collections.OrderedDict([
 ])
 
 
+def index_links(movies_dir):
+    """Read movies/ ONCE: {id: [paths]} for every entry named <id>.<ext> (the <id>_.pid files are skipped).
+    Looking ids up one by one with glob re-reads the whole folder each time - far too slow for 500k entries."""
+    idx = collections.defaultdict(list)
+    for e in os.scandir(movies_dir):
+        m = re.match(r"^(\d+)\.", e.name)
+        if m:
+            idx[m.group(1)].append(e.path)
+    return idx
+
+
 def links_for_id(movies_dir, sid):
     """All entries in movies/ named <id>.<ext> (the .pid files are named <id>_.pid and are not matched)."""
     return glob.glob(os.path.join(glob.escape(movies_dir), glob.escape(sid) + ".*"))
@@ -882,13 +893,14 @@ def cmd_export_cleanup(a):
     print("Categories included: %s" % ", ".join(wanted))
     picked, played, per_cat, titles = [], 0, collections.Counter(), collections.defaultdict(collections.Counter)
     seen = set()
+    idx = index_links(a.movies_dir)
     for r in read_attention(f):
         sid, detail, title, oldfile = r[0], r[4], r[2], r[3]
         cat = next((c for c, (prefix, _) in CLEANUP_CATEGORIES.items() if detail.startswith(prefix)), None)
         if cat not in wanted or not sid.isdigit() or sid in seen:
             continue
         seen.add(sid)
-        links = links_for_id(a.movies_dir, sid)
+        links = idx.get(sid, [])
         if any(os.path.exists(x) for x in links):
             played += 1                      # it plays now - never remove
             continue
@@ -935,8 +947,9 @@ def cmd_remove_links(a):
         return 3
     ids = re.findall(r"\d+", open(a.remove_links).read())
     dead, alive, none_ = [], 0, 0
+    idx = index_links(a.movies_dir)
     for sid in ids:
-        links = links_for_id(a.movies_dir, sid)
+        links = idx.get(sid, [])
         if not links:
             none_ += 1
             continue
