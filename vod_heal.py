@@ -1011,6 +1011,274 @@ def cmd_find_gone(a):
     return 0
 
 
+def cmd_review(a):
+    """Interactive review of the 'NEEDS YOUR ATTENTION' items from the last run.
+
+    Categories and strategy:
+      double-episode  -> auto-accept (tool already verified this episode is first in the file)
+      title-only      -> show the match, y/n per title
+      several-folders -> show numbered options, pick one or g/s
+      look-alike      -> show a sample, then bulk: g=mark all gone / s=skip all / i=one by one
+      missing-file    -> bulk: g=mark all gone / s=skip all
+      gone            -> bulk: g=mark all gone / s=skip all
+
+    Writes a worksheet_review_<stamp>.tsv that you pass to --decisions on the next run.
+    Also prints any double-episode ids to a file for --only-ids so they are repaired next run.
+    """
+    f = latest_attention(a.log_dir)
+    if not f:
+        print("No report found in %s. Run the dry run first." % a.log_dir)
+        return 1
+    rows = read_attention(f)
+    if not rows:
+        print("No items needing attention in %s." % f)
+        return 0
+
+    healer = Healer(a.media_root or ["/mnt/unionfs/Media"], a.index_depth,
+                    not a.no_auto_pick, True, {}, {}, 0.0)
+    short = lambda p: p.replace("/mnt/unionfs/Media/", "").replace("/mnt/unionfs/", "")
+
+    def ask(prompt, valid):
+        while True:
+            try:
+                v = input(prompt).strip().lower()
+            except (EOFError, KeyboardInterrupt):
+                print("\nStopped.")
+                return None
+            if v in valid:
+                return v
+            print("  Type one of: %s" % " / ".join(valid))
+
+    def group(prefix):
+        seen = {}
+        for r in rows:
+            if r[4].startswith(prefix) and r[2] not in seen:
+                seen[r[2]] = r
+        return list(seen.values())  # one row per title
+
+    decisions = {}      # title_folder -> decision string (path / GONE / SKIP)
+    double_ids = []     # ids to repair next run with --only-ids
+
+    W = 72
+    stamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+
+    # ------------------------------------------------------------------ #
+    # 1. double-episode: auto-accept                                       #
+    # ------------------------------------------------------------------ #
+    doubles = group("multi-episode-file")
+    if doubles:
+        print("\n" + "=" * W)
+        print("DOUBLE-EPISODE FILES  (%d titles)" % len(doubles))
+        print("=" * W)
+        print("The tool found these episodes replaced by a double-episode file.")
+        print("It already checked that this episode is the FIRST one in the file,")
+        print("so playback will start at the right place.")
+        print("These will be auto-repaired on the next --apply run.")
+        for r in doubles[:8]:
+            newfile = r[4].split(": ", 1)[1] if ": " in r[4] else r[4]
+            print("  %-40s  ->  %s" % (r[2][:40], os.path.basename(newfile)[:50]))
+        if len(doubles) > 8:
+            print("  ... and %d more" % (len(doubles) - 8))
+        double_ids = [r[0] for r in rows if r[4].startswith("multi-episode-file") and r[0]]
+
+    # ------------------------------------------------------------------ #
+    # 2. title-only: one-by-one y/n                                       #
+    # ------------------------------------------------------------------ #
+    title_only = group("title-only-candidate")
+    if title_only:
+        print("\n" + "=" * W)
+        print("TITLE-ONLY MATCHES  (%d titles)" % len(title_only))
+        print("=" * W)
+        print("These matched by title only — no shared IMDb/TVDB/TMDB id.")
+        print("Check each one: it might be the same film/show, or a remake with the same name.\n")
+        for r in title_only:
+            folder = r[2]
+            candidate = r[4].replace("title-only-candidate: ", "").split(" | ")[0]
+            print("  OLD: %s" % folder)
+            print("  NEW: %s" % short(candidate))
+            ch = ask("  Accept this match? [y=yes / n=no/skip] : ", ("y", "n"))
+            if ch is None:
+                break
+            if ch == "y":
+                decisions[folder] = candidate
+            else:
+                decisions[folder] = "SKIP"
+            print()
+
+    # ------------------------------------------------------------------ #
+    # 3. several-folders: numbered pick                                   #
+    # ------------------------------------------------------------------ #
+    several = group("several-look-alike-folders")
+    if several:
+        print("\n" + "=" * W)
+        print("SEVERAL FOLDERS SHARE THIS TITLE  (%d titles)" % len(several))
+        print("=" * W)
+        print("For each title, pick the right folder, or g=mark gone, s=skip.\n")
+        for r in several:
+            folder = r[2]
+            options_raw = r[4].replace("several-look-alike-folders: ", "")
+            options = [o.strip() for o in options_raw.split(" | ") if o.strip()]
+            print("  TITLE: %s" % folder)
+            for i, opt in enumerate(options, 1):
+                try:
+                    yr = YEAR_RE.search(opt)
+                    tags = tag_keys(os.path.basename(opt))
+                    tag_str = ("  [%s]" % ", ".join(tags)) if tags else ""
+                    print("    %d) %s%s" % (i, short(opt), tag_str))
+                except Exception:
+                    print("    %d) %s" % (i, short(opt)))
+            valid = [str(i) for i in range(1, len(options) + 1)] + ["g", "s"]
+            ch = ask("  Pick [1-%d / g=gone / s=skip] : " % len(options), valid)
+            if ch is None:
+                break
+            if ch == "g":
+                decisions[folder] = "GONE"
+            elif ch == "s":
+                decisions[folder] = "SKIP"
+            else:
+                decisions[folder] = options[int(ch) - 1]
+            print()
+
+    # ------------------------------------------------------------------ #
+    # 4. look-alike: sample then bulk                                     #
+    # ------------------------------------------------------------------ #
+    lookalikes = group("look-alike-rejected")
+    if lookalikes:
+        print("\n" + "=" * W)
+        print("LOOK-ALIKE (WRONG YEAR / WRONG IMDB ID)  (%d titles)" % len(lookalikes))
+        print("=" * W)
+        print("A folder with a similar name exists but has a different IMDb id or year.")
+        print("These are almost always a different version/remake — safe to mark as gone.\n")
+        sample = lookalikes[:6]
+        for r in sample:
+            reason = r[4].replace("look-alike-rejected (", "").rstrip(")")
+            print("  %-45s  rejected: %s" % (r[2][:45], reason[:50]))
+        if len(lookalikes) > 6:
+            print("  ... and %d more\n" % (len(lookalikes) - 6))
+        ch = ask("  [g=mark ALL gone / s=skip all (leave broken) / i=review one by one] : ", ("g", "s", "i"))
+        if ch is None:
+            pass
+        elif ch == "g":
+            for r in lookalikes:
+                decisions[r[2]] = "GONE"
+        elif ch == "s":
+            for r in lookalikes:
+                decisions[r[2]] = "SKIP"
+        else:
+            for r in lookalikes:
+                reason = r[4].replace("look-alike-rejected (", "").rstrip(")")
+                print("\n  TITLE: %s" % r[2])
+                print("  Reason rejected: %s" % reason)
+                ic = ask("  [g=gone / s=skip] : ", ("g", "s"))
+                if ic is None:
+                    break
+                decisions[r[2]] = "GONE" if ic == "g" else "SKIP"
+
+    # ------------------------------------------------------------------ #
+    # 5. missing-file: bulk                                               #
+    # ------------------------------------------------------------------ #
+    missing = group("folder-exists-but-no-matching-file")
+    if missing:
+        print("\n" + "=" * W)
+        print("FOLDER EXISTS BUT FILE IS GONE  (%d titles)" % len(missing))
+        print("=" * W)
+        print("The show/movie folder is still on the drive but the specific file was deleted.")
+        print("This usually means Radarr/Sonarr removed an old version without replacing it yet.\n")
+        for r in missing[:6]:
+            print("  %s" % r[2][:70])
+        if len(missing) > 6:
+            print("  ... and %d more" % (len(missing) - 6))
+        print()
+        ch = ask("  [g=mark ALL gone / s=skip all (leave broken, Radarr may fix later)] : ", ("g", "s"))
+        if ch is None:
+            pass
+        elif ch == "g":
+            for r in missing:
+                decisions[r[2]] = "GONE"
+        else:
+            for r in missing:
+                decisions[r[2]] = "SKIP"
+
+    # ------------------------------------------------------------------ #
+    # 6. gone (folder completely missing): bulk                           #
+    # ------------------------------------------------------------------ #
+    gone_titles = group("folder-missing")
+    if gone_titles:
+        print("\n" + "=" * W)
+        print("TITLE FOLDER COMPLETELY GONE  (%d titles)" % len(gone_titles))
+        print("=" * W)
+        print("These folders have disappeared from the drive entirely — deleted or renamed")
+        print("beyond recognition. There is nothing to repoint to.\n")
+        for r in gone_titles[:6]:
+            print("  %s" % r[2][:70])
+        if len(gone_titles) > 6:
+            print("  ... and %d more" % (len(gone_titles) - 6))
+        print()
+        ch = ask("  [g=mark ALL gone / s=skip all (leave broken)] : ", ("g", "s"))
+        if ch is None:
+            pass
+        elif ch == "g":
+            for r in gone_titles:
+                decisions[r[2]] = "GONE"
+        else:
+            for r in gone_titles:
+                decisions[r[2]] = "SKIP"
+
+    # ------------------------------------------------------------------ #
+    # Write results                                                        #
+    # ------------------------------------------------------------------ #
+    ws_file = os.path.join(a.log_dir, "worksheet_review_%s.tsv" % stamp)
+    with open(ws_file, "w", encoding="utf-8") as fh:
+        fh.write("links\twhy\told_title_folder\tsuggestion\tdecision\texample_id\n")
+        seen_t = set()
+        for r in rows:
+            folder = r[2]
+            if folder in seen_t:
+                continue
+            seen_t.add(folder)
+            dec = decisions.get(folder, "")
+            fh.write("1\t%s\t%s\t\t%s\t%s\n" % (explain(r[4]), folder, dec, r[0]))
+
+    de_file = ""
+    if double_ids:
+        de_file = os.path.join(a.log_dir, "double_ep_ids_%s.txt" % stamp)
+        with open(de_file, "w") as fh:
+            fh.write(",".join(double_ids) + "\n")
+
+    print("\n" + "=" * W)
+    print("REVIEW COMPLETE")
+    print("=" * W)
+    gone_c  = sum(1 for v in decisions.values() if v == "GONE")
+    skip_c  = sum(1 for v in decisions.values() if v == "SKIP")
+    pick_c  = sum(1 for v in decisions.values() if v not in ("GONE", "SKIP", ""))
+    print("  Marked GONE : %d  (will be cleaned up)" % gone_c)
+    print("  Picked path : %d  (will be repaired on next run)" % pick_c)
+    print("  Skipped     : %d  (left broken for now)" % skip_c)
+    print("  Decisions file: %s" % ws_file)
+    if de_file:
+        print("  Double-ep ids : %s" % de_file)
+    print("")
+    print("NEXT STEPS:")
+    if double_ids:
+        print("  1. Repair double-episode files:")
+        print("     sudo -u xtreamcodes python3 %s --only-ids %s --apply" % (
+            os.path.abspath(sys.argv[0]), de_file))
+        print("  2. Apply your review decisions (GONE + picked paths):")
+        print("     sudo -u xtreamcodes python3 %s --decisions %s --apply" % (
+            os.path.abspath(sys.argv[0]), ws_file))
+        print("  3. Then run cleanup to remove the GONE titles from the panel:")
+        print("     sudo -u xtreamcodes python3 %s --decisions %s --apply --cleanup" % (
+            os.path.abspath(sys.argv[0]), ws_file))
+    else:
+        print("  1. Apply your decisions (GONE + picked paths):")
+        print("     sudo -u xtreamcodes python3 %s --decisions %s --apply" % (
+            os.path.abspath(sys.argv[0]), ws_file))
+        print("  2. Then run cleanup to remove the GONE titles from the panel:")
+        print("     sudo -u xtreamcodes python3 %s --decisions %s --apply --cleanup" % (
+            os.path.abspath(sys.argv[0]), ws_file))
+    return 0
+
+
 def cmd_peek(a):
     """Read-only. Shows a few real examples of the groups that need a human look, in plain words."""
     f = latest_attention(a.log_dir)
@@ -1469,6 +1737,14 @@ def main():
                          "which N it would pick")
     ap.add_argument("--only-ids", metavar="FILE_OR_LIST",
                     help="repair only these stream ids (a file, or comma-separated)")
+    ap.add_argument("--review", action="store_true",
+                    help="interactive: walk through the 'NEEDS YOUR ATTENTION' items from the last run. "
+                         "Asks you what to do for each title (pick a folder / mark gone / skip). "
+                         "Writes a decisions file you pass to --decisions on the next --apply run.")
+    ap.add_argument("--panel-url", metavar="URL",
+                    help="base URL of your panel admin, e.g. http://1.2.3.4:25500  "
+                         "After --apply the summary prints direct admin links to a few repaired titles "
+                         "so you can check them in the browser.")
     ap.add_argument("--panel-ids", metavar="FILE",
                     help="optional: every movie/episode id the PANEL really has (one per line). "
                          "If omitted, ids are read automatically from the panel DB when pymysql is installed. "
@@ -1560,6 +1836,8 @@ def main():
         return cmd_remove_links(a)
     if a.peek:
         return cmd_peek(a)
+    if a.review:
+        return cmd_review(a)
 
     roots = a.media_root or ["/mnt/unionfs/Media"]
     try:
@@ -2026,6 +2304,33 @@ def main():
     print("-" * W)
     if check_line:
         print(check_line)
+    # --- admin panel links for manual verification ---
+    if a.apply and check_line.startswith("SELF-CHECK PASS") and getattr(a, "panel_url", None):
+        fixed_rows = [r for r in rows if r[0] == "FIXED"]
+        sample = fixed_rows[:8]
+        if sample:
+            base = a.panel_url.rstrip("/")
+            print("")
+            print("Check these repaired titles in your admin panel:")
+            for r in sample:
+                mid = re.match(r"^(\d+)\.", os.path.basename(r[1]))
+                if mid:
+                    print("  id %-8s  %s/admin/index.php?id=%s&action=stream_edit" % (
+                        mid.group(1), base, mid.group(1)))
+    elif a.apply and check_line.startswith("SELF-CHECK PASS"):
+        fixed_rows = [r for r in rows if r[0] == "FIXED"]
+        sample = fixed_rows[:8]
+        if sample:
+            print("")
+            print("To verify repairs in your admin panel, check these stream ids:")
+            for r in sample:
+                mid = re.match(r"^(\d+)\.", os.path.basename(r[1]))
+                if mid:
+                    print("  id %-8s  %s  ->  %s" % (
+                        mid.group(1),
+                        os.path.basename(r[2])[:45],
+                        os.path.basename(r[3])[:45]))
+            print("  (pass --panel-url http://YOUR_IP:25500 to get direct clickable links)")
     print("Files in %s:" % a.log_dir)
     if ws_file:
         print("  worksheet_%s.tsv         <- %d titles. Fill the 'decision' column, then re-run with" % (stamp, n_ws))
@@ -2063,6 +2368,10 @@ def main():
         print("Play these in the panel / your app. If they are fine, run the same command again WITHOUT")
         print("--trial to repair the rest. If not, undo with:  python3 %s --undo %s" % (os.path.abspath(sys.argv[0]), tsv))
     print("Took %.0fs." % (time.time() - t0))
+    if not a.apply and len(attn) > 0:
+        print("")
+        print("To work through the %d items needing attention interactively:" % len(attn))
+        print("  sudo -u xtreamcodes python3 %s --review" % os.path.abspath(sys.argv[0]))
 
     # --- integrated --cleanup ---
     if a.cleanup:
