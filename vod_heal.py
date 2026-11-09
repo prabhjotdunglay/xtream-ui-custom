@@ -104,14 +104,22 @@ def db_fetch_ids(conn):
 
 
 def db_fetch_years(conn):
-    """Return dict {stream_id_str: year_int} from streams.release_date for movies/episodes."""
+    """Return dict {stream_id_str: year_int} from streams.movie_propeties JSON for movies/episodes."""
     years = {}
     with conn.cursor() as c:
-        c.execute("SELECT `id`, `release_date` FROM `streams` WHERE `type` IN (2, 5) AND `release_date` IS NOT NULL AND `release_date` != ''")
+        c.execute(
+            "SELECT `id`, `movie_propeties` FROM `streams` "
+            "WHERE `type` IN (2, 5) AND `movie_propeties` IS NOT NULL AND `movie_propeties` != ''"
+        )
         for row in c.fetchall():
-            m = re.match(r"^(\d{4})", str(row[1]).strip().strip('"'))
-            if m and 1880 <= int(m.group(1)) <= 2100:
-                years[str(row[0])] = int(m.group(1))
+            try:
+                props = json.loads(row[1]) if row[1] else {}
+                rd = str(props.get("releaseDate") or props.get("release_date") or "").strip().strip('"')
+                m = re.match(r"^(\d{4})", rd)
+                if m and 1880 <= int(m.group(1)) <= 2100:
+                    years[str(row[0])] = int(m.group(1))
+            except Exception:
+                pass
     return years
 
 
@@ -1741,10 +1749,9 @@ def main():
                     help="interactive: walk through the 'NEEDS YOUR ATTENTION' items from the last run. "
                          "Asks you what to do for each title (pick a folder / mark gone / skip). "
                          "Writes a decisions file you pass to --decisions on the next --apply run.")
-    ap.add_argument("--panel-url", metavar="URL",
-                    help="base URL of your panel admin, e.g. http://1.2.3.4:25500  "
-                         "After --apply the summary prints direct admin links to a few repaired titles "
-                         "so you can check them in the browser.")
+    ap.add_argument("--panel-url", metavar="URL", default="",
+                    help="base URL of your admin panel, e.g. http://1.2.3.4:2053  (default: auto-detect from panel config). "
+                         "After --apply the summary prints direct admin links to repaired titles.")
     ap.add_argument("--panel-ids", metavar="FILE",
                     help="optional: every movie/episode id the PANEL really has (one per line). "
                          "If omitted, ids are read automatically from the panel DB when pymysql is installed. "
@@ -1813,7 +1820,13 @@ def main():
     if not getattr(a, "no_db", False):
         _db_conn, _db_warn = db_connect()
 
-    if a.undo:
+    # --- auto-detect panel URL if not given ---
+    if not getattr(a, "panel_url", None) and _db_conn is not None:
+        try:
+            cfg = read_panel_config()
+            a.panel_url = "http://%s:2053" % cfg["host"]
+        except Exception:
+            pass
         do_undo(a.undo)
         return 0
     if a.undo_orphans:
@@ -2266,89 +2279,115 @@ def main():
                           "not resolve. UNDO NOW:  python3 %s --undo %s"
                           % (changed, vanished, not_resolving, os.path.abspath(sys.argv[0]), tsv))
 
-    W = 66
+    W = 70
+    D = "-" * W
+    me = os.path.abspath(sys.argv[0])
+
     print("")
     print("=" * W)
-    print("VOD HEAL SUMMARY  " + ("(DRY RUN - nothing was changed)" if not a.apply else "(APPLIED)"))
-    print("script version: " + VERSION)
-    print("=" * W)
-    if mirror_info:
-        print("MIRROR OF B  (only the links B changed were checked against the drive)")
-        print("  Links on this server ........ %d   (%d leftovers ignored, %d with no counterpart on B)"
-              % (mirror_info["links"], mirror_info["orph"], mirror_info["no_b"]))
-        print("  Same as B ................... %d   (assumed working, like B)" % mirror_info["same"])
-        print("  Different from B ............ %d   (%d already work here and are left alone)"
-              % (mirror_info["differ"], mirror_info["alive"]))
-        print("Links compared with B ......... %d" % total)
-    elif panel_ids is not None:
-        print("All links on this LB ......... %d" % (total + len(orphans)))
-        print("  LEFTOVER (title deleted) ... %d   <- not in the panel; ignored. %d dead, %d still point at a file"
-              % (len(orphans), sum(1 for o in orphans if not o[2]), sum(1 for o in orphans if o[2])))
-        print("Links of REAL titles ......... %d" % total)
-    else:
-        print("All VOD links ................ %d" % total)
-    print("  Working (never touched) .... %d" % ok_count)
-    print("  Broken ..................... %d  (%.1f%%)" % (len(broken), pct))
     if a.apply:
-        print("     REPAIRED ................ %d" % fixed)
+        print("  VOD HEAL  —  APPLIED")
     else:
-        print("     CAN BE REPAIRED ......... %d   <- run again with --apply" % fixed)
+        print("  VOD HEAL  —  DRY RUN  (nothing was changed)")
+    print("=" * W)
+
+    # ---- counts block ----
+    if mirror_info:
+        print("")
+        print("  MODE : Mirror from B  (only links B changed were checked on the drive)")
+        print("  Links on this server  %d" % (mirror_info["links"],))
+        print("    Same as B           %d  (assumed working)" % mirror_info["same"])
+        print("    Different from B    %d  (%d already work here, left alone)" % (mirror_info["differ"], mirror_info["alive"]))
+        print("    Leftovers ignored   %d  (ids not in the panel)" % mirror_info["orph"])
+        print("    No counterpart on B %d" % mirror_info["no_b"])
+    elif panel_ids is not None:
+        orph_dead    = sum(1 for o in orphans if not o[2])
+        orph_working = sum(1 for o in orphans if o[2])
+        print("")
+        print("  All links on this LB      %d" % (total + len(orphans)))
+        if orphans:
+            print("    Leftovers (not in panel)  %d  (%d dead, %d still point at a file — run --remove-orphans)"
+                  % (len(orphans), orph_dead, orph_working))
+        print("    Real titles               %d" % total)
+    else:
+        print("")
+        print("  All VOD links   %d" % total)
+
+    print("")
+    print("  Working (not touched)   %d" % ok_count)
+    print("  Broken                  %d  (%.1f%%)" % (len(broken), pct))
+    if a.apply:
+        print("    ✓ Repaired            %d" % fixed)
+    else:
+        print("    → CAN BE REPAIRED     %d  ← add --apply to fix these" % fixed)
     if held:
-        print("     HELD BACK FOR LATER ..... %d   (not part of this %s; still broken, untouched)"
+        print("    ⏸ Held back           %d  (not in this %s; run again without --trial to do them)"
               % (held, "trial" if a.trial else "selection"))
-    print("     NEEDS YOUR ATTENTION .... %d" % len(attn))
-    for k, v in reasons.most_common():
-        print("          %6d  %s" % (v, k))
+    if attn:
+        print("    ✗ Needs your input    %d" % len(attn))
+        for k, v in reasons.most_common():
+            print("        %5d  %s" % (v, k))
     if ext_mismatch and not a.skip_ext_change:
-        print("  (%d of the repairs change the file type, e.g. .avi -> .mkv; handled automatically)" % ext_mismatch)
-    print("-" * W)
+        print("")
+        print("  Note: %d repairs changed the file extension (e.g. .avi → .mkv) — handled automatically." % ext_mismatch)
+
+    # ---- result / self-check ----
+    print("")
+    print(D)
     if check_line:
-        print(check_line)
-    # --- admin panel links for manual verification ---
-    if a.apply and check_line.startswith("SELF-CHECK PASS") and getattr(a, "panel_url", None):
+        if "PASS" in check_line:
+            print("  ✓ " + check_line)
+        else:
+            print("  ✗ " + check_line)
+
+    # ---- admin verification links ----
+    if a.apply and check_line and "PASS" in check_line:
         fixed_rows = [r for r in rows if r[0] == "FIXED"]
-        sample = fixed_rows[:8]
+        sample = fixed_rows[:6]
         if sample:
-            base = a.panel_url.rstrip("/")
+            base = (getattr(a, "panel_url", "") or "").rstrip("/")
             print("")
-            print("Check these repaired titles in your admin panel:")
-            for r in sample:
-                mid = re.match(r"^(\d+)\.", os.path.basename(r[1]))
-                if mid:
-                    print("  id %-8s  %s/admin/index.php?id=%s&action=stream_edit" % (
-                        mid.group(1), base, mid.group(1)))
-    elif a.apply and check_line.startswith("SELF-CHECK PASS"):
-        fixed_rows = [r for r in rows if r[0] == "FIXED"]
-        sample = fixed_rows[:8]
-        if sample:
-            print("")
-            print("To verify repairs in your admin panel, check these stream ids:")
-            for r in sample:
-                mid = re.match(r"^(\d+)\.", os.path.basename(r[1]))
-                if mid:
-                    print("  id %-8s  %s  ->  %s" % (
-                        mid.group(1),
-                        os.path.basename(r[2])[:45],
-                        os.path.basename(r[3])[:45]))
-            print("  (pass --panel-url http://YOUR_IP:25500 to get direct clickable links)")
-    print("Files in %s:" % a.log_dir)
+            if base:
+                print("  Open these in your admin panel to verify the repairs:")
+                for r in sample:
+                    mid = re.match(r"^(\d+)\.", os.path.basename(r[1]))
+                    if mid:
+                        print("    %s/admin/index.php?id=%s&action=stream_edit" % (base, mid.group(1)))
+            else:
+                print("  Verify these repaired stream ids in your admin panel:")
+                for r in sample:
+                    mid = re.match(r"^(\d+)\.", os.path.basename(r[1]))
+                    if mid:
+                        print("    id %-8s  %s  →  %s" % (
+                            mid.group(1),
+                            os.path.basename(r[2])[:40],
+                            os.path.basename(r[3])[:40]))
+
+    # ---- DB updates ----
+    if db_ext_n and a.apply:
+        print("  ✓ File extension (target_container) updated in panel DB: %d rows" % db_ext_n)
+    elif sqlfile:
+        print("  ! Run on your panel DB to fix file extensions:  %s" % os.path.basename(sqlfile))
+    if db_src_n and a.apply:
+        print("  ✓ Movie Path / URL updated in panel DB: %d rows" % db_src_n)
+    elif srcfile:
+        print("  ! Run on your panel DB to update Movie Path:  %s" % os.path.basename(srcfile))
+
+    # ---- log files ----
+    print("")
+    print(D)
+    print("  Log folder: %s" % a.log_dir)
+    print("")
     if ws_file:
-        print("  worksheet_%s.tsv         <- %d titles. Fill the 'decision' column, then re-run with" % (stamp, n_ws))
-        print("                              --decisions <this file>   (path / OK / GONE / SKIP)")
+        print("  worksheet_...tsv       %d titles needing a decision (see --review)" % n_ws)
     if gone_file:
-        print("  gone_ids_%s.txt          <- %d links you marked gone, for later cleanup" % (stamp, len(gone_ids)))
-    print("  needs_attention_%s.tsv   <- open this one: id, why, title, old file" % stamp)
-    print("  heal_%s.tsv              <- every link and what happened (also used for --undo)" % stamp)
+        print("  gone_ids_...txt        %d ids you marked gone" % len(gone_ids))
+    print("  needs_attention_...tsv  full list of broken items with reasons")
+    print("  heal_...tsv             every link and what changed  (used by --undo)")
     if sqlfile:
-        print("  %s  <- run on the PANEL database after applying" % os.path.basename(sqlfile))
-    elif db_ext_n and a.apply:
-        print("  target_container updated in panel DB: %d rows" % db_ext_n)
-    if srcfile:
-        print("  %s  <- (optional) updates 'Movie Path / URL' in admin; run on the PANEL database;" %
-              os.path.basename(srcfile))
-        print("      it backs up the old values first; undo with source_undo_%s.sql" % stamp)
-    elif db_src_n and a.apply:
-        print("  stream_source (Movie Path / URL) updated in panel DB: %d rows" % db_src_n)
+        print("  ext_updates_...sql     copy to your main DB server and run with mysql")
+
+    # ---- trial block ----
     if trial_info:
         trial_file = os.path.join(a.log_dir, "trial_%s.tsv" % stamp)
         with open(trial_file, "w", encoding="utf-8") as fh:
@@ -2356,17 +2395,42 @@ def main():
             for t in trial_info:
                 fh.write("\t".join(t) + "\n")
         print("")
-        print("TRIAL: %s these %d links (a mix of kinds, so each type of repair gets tested):"
-              % ("repaired" if a.apply else "would repair", len(trial_info)))
-        for k, i, title, oldn, newn, tags in trial_info:
-            print("  id %-8s [%s]  %s" % (i, k, title))
-            print("      was: %s" % oldn[:100])
-            print("      now: %s" % newn[:100])
+        print(D)
+        print("  TRIAL — %s %d links" % ("repaired" if a.apply else "would repair", len(trial_info)))
         print("")
-        print("To see the names in your panel, run this on the main database server:")
-        print("  SELECT id, stream_display_name FROM streams WHERE id IN (%s);" % ",".join(t[1] for t in trial_info))
-        print("Play these in the panel / your app. If they are fine, run the same command again WITHOUT")
-        print("--trial to repair the rest. If not, undo with:  python3 %s --undo %s" % (os.path.abspath(sys.argv[0]), tsv))
+        for k, i, title, oldn, newn, tags in trial_info:
+            print("  id %-8s  [%s]  %s" % (i, k, title))
+            print("    was: %s" % oldn[:90])
+            print("    now: %s" % newn[:90])
+        print("")
+        if a.apply:
+            base = (getattr(a, "panel_url", "") or "").rstrip("/")
+            if base:
+                print("  Check these in your admin panel, then play them:")
+                for _, i, _, _, _, _ in trial_info:
+                    print("    %s/admin/index.php?id=%s&action=stream_edit" % (base, i))
+            print("")
+            print("  If they play correctly, run without --trial to repair the rest.")
+            print("  If something is wrong:  python3 %s --undo %s" % (me, tsv))
+        else:
+            print("  Add --apply to repair these %d, then play them before doing the rest." % len(trial_info))
+
+    # ---- what to do next ----
+    print("")
+    print(D)
+    print("  WHAT TO DO NEXT")
+    print("")
+    if not a.apply and fixed > 0:
+        print("  1. Fix the %d repairable links:" % fixed)
+        print("     sudo -u xtreamcodes python3 %s --apply" % me)
+    if attn:
+        step = 2 if (not a.apply and fixed > 0) else 1
+        print("  %d. Work through the %d items that need a decision:" % (step, len(attn)))
+        print("     sudo -u xtreamcodes python3 %s --review" % me)
+    if a.apply and fixed > 0 and not a.cleanup:
+        print("  When ready, clean up dead titles from the panel:")
+        print("     sudo -u xtreamcodes python3 %s --apply --cleanup" % me)
+
     print("Took %.0fs." % (time.time() - t0))
     if not a.apply and len(attn) > 0:
         print("")
