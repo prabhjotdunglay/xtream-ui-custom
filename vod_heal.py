@@ -115,10 +115,25 @@ def db_fetch_years(conn):
     return years
 
 
-def db_apply_ext_updates(conn, ext_ids):
-    """Apply target_container updates directly to the panel DB."""
+def db_backup_rows(conn, stamp, table_suffix, select_sql, select_args=()):
+    """Save a snapshot of rows into a backup table vod_bk_<table_suffix>_<stamp>.
+    Returns the backup table name. Drops any previous backup with the same stamp (shouldn't exist)."""
+    bk = "vod_bk_%s_%s" % (table_suffix, stamp)
+    with conn.cursor() as c:
+        c.execute("DROP TABLE IF EXISTS `%s`" % bk)
+        c.execute("CREATE TABLE `%s` %s" % (bk, select_sql), select_args)
+    conn.commit()
+    return bk
+
+
+def db_apply_ext_updates(conn, ext_ids, stamp):
+    """Back up then apply target_container updates directly to the panel DB."""
     if not ext_ids:
-        return 0
+        return 0, ""
+    all_ids = [i for idl in ext_ids.values() for i in idl]
+    ph = ",".join(["%s"] * len(all_ids))
+    bk = db_backup_rows(conn, stamp, "ext",
+        "SELECT `id`, `target_container` FROM `streams` WHERE `id` IN (%s)" % ph, all_ids)
     n = 0
     with conn.cursor() as c:
         for ext, idl in sorted(ext_ids.items()):
@@ -130,13 +145,17 @@ def db_apply_ext_updates(conn, ext_ids):
                 )
                 n += c.rowcount
     conn.commit()
-    return n
+    return n, bk
 
 
-def db_apply_source_updates(conn, src_updates):
-    """Apply stream_source path updates directly to the panel DB, keeping the server prefix."""
+def db_apply_source_updates(conn, src_updates, stamp):
+    """Back up then apply stream_source path updates directly to the panel DB, keeping the server prefix."""
     if not src_updates:
-        return 0
+        return 0, ""
+    ids = sorted(src_updates, key=int)
+    ph = ",".join(["%s"] * len(ids))
+    bk = db_backup_rows(conn, stamp, "src",
+        "SELECT `id`, `stream_source` FROM `streams` WHERE `id` IN (%s)" % ph, ids)
     n = 0
     with conn.cursor() as c:
         for sid, path in src_updates.items():
@@ -151,11 +170,12 @@ def db_apply_source_updates(conn, src_updates):
             c.execute(sql)
             n += c.rowcount
     conn.commit()
-    return n
+    return n, bk
 
 
-def db_cleanup_ids(conn, ids, categories, keep_empty_series=False, dry_run=True):
+def db_cleanup_ids(conn, ids, categories, stamp, keep_empty_series=False, dry_run=True):
     """Remove dead VOD entries from the panel DB.  ids = list/set of str.
+    Before deleting, saves all affected rows to backup tables vod_bk_cleanup_<stamp>_*.
     Returns (movies_del, episodes_del, series_del, bouquet_changes) counts."""
     if not ids:
         return 0, 0, 0, {}
@@ -201,10 +221,17 @@ def db_cleanup_ids(conn, ids, categories, keep_empty_series=False, dry_run=True)
                     bq[bname] = bq.get(bname, 0) + cnt
         return len(movie_ids), len(ep_ids), len(series_del), bq
 
-    # real delete — one transaction
-    with conn.cursor() as c:
-        all_ids = movie_ids + ep_ids
+    # real delete — back up first, then delete in one transaction
+    all_ids = movie_ids + ep_ids
+    if all_ids:
         ph_all = ",".join(["%s"] * len(all_ids))
+        db_backup_rows(conn, stamp, "cleanup_streams",
+            "SELECT * FROM `streams` WHERE `id` IN (%s) AND `type` IN (2,5)" % ph_all, all_ids)
+    if ep_ids:
+        ph_ep = ",".join(["%s"] * len(ep_ids))
+        db_backup_rows(conn, stamp, "cleanup_episodes",
+            "SELECT * FROM `series_episodes` WHERE `stream_id` IN (%s)" % ph_ep, ep_ids)
+    with conn.cursor() as c:
         if ep_ids:
             ph_ep = ",".join(["%s"] * len(ep_ids))
             c.execute("DELETE FROM `series_episodes` WHERE `stream_id` IN (%s)" % ph_ep, ep_ids)
@@ -214,6 +241,7 @@ def db_cleanup_ids(conn, ids, categories, keep_empty_series=False, dry_run=True)
             c.execute("DELETE FROM `streams_sys` WHERE `stream_id` IN (%s)" % ph_s, series_del)
             c.execute("DELETE FROM `streams` WHERE `id` IN (%s)" % ph_s, series_del)
         if all_ids:
+            ph_all = ",".join(["%s"] * len(all_ids))
             c.execute("DELETE FROM `bouquet_channels` WHERE `stream_id` IN (%s)" % ph_all, all_ids)
             c.execute("DELETE FROM `streams_sys` WHERE `stream_id` IN (%s)" % ph_all, all_ids)
             c.execute("DELETE FROM `streams` WHERE `id` IN (%s) AND `type` IN (2,5)" % ph_all, all_ids)
@@ -1850,10 +1878,11 @@ def main():
 
     sqlfile = ""
     db_ext_n = 0
+    db_ext_bk = ""
     if ext_ids:
         if _db_conn is not None and a.apply:
             try:
-                db_ext_n = db_apply_ext_updates(_db_conn, ext_ids)
+                db_ext_n, db_ext_bk = db_apply_ext_updates(_db_conn, ext_ids, stamp)
             except Exception as e:
                 print("WARNING: could not apply target_container updates to DB: %s" % e)
                 # fall back to writing the SQL file
@@ -1879,10 +1908,11 @@ def main():
 
     srcfile = ""
     db_src_n = 0
+    db_src_bk = ""
     if src_updates and a.apply:
         if _db_conn is not None:
             try:
-                db_src_n = db_apply_source_updates(_db_conn, src_updates)
+                db_src_n, db_src_bk = db_apply_source_updates(_db_conn, src_updates, stamp)
             except Exception as e:
                 print("WARNING: could not apply stream_source updates to DB: %s" % e)
                 srcfile = write_source_sql(a.log_dir, stamp, src_updates)
@@ -2013,13 +2043,13 @@ def main():
     if sqlfile:
         print("  %s  <- run on the PANEL database after applying" % os.path.basename(sqlfile))
     elif db_ext_n and a.apply:
-        print("  target_container updated in panel DB: %d rows" % db_ext_n)
+        print("  target_container updated in panel DB: %d rows  (backup: %s)" % (db_ext_n, db_ext_bk))
     if srcfile:
         print("  %s  <- (optional) updates 'Movie Path / URL' in admin; run on the PANEL database;" %
               os.path.basename(srcfile))
         print("      it backs up the old values first; undo with source_undo_%s.sql" % stamp)
     elif db_src_n and a.apply:
-        print("  stream_source (Movie Path / URL) updated in panel DB: %d rows" % db_src_n)
+        print("  stream_source (Movie Path / URL) updated in panel DB: %d rows  (backup: %s)" % (db_src_n, db_src_bk))
     if trial_info:
         trial_file = os.path.join(a.log_dir, "trial_%s.tsv" % stamp)
         with open(trial_file, "w", encoding="utf-8") as fh:
@@ -2069,7 +2099,7 @@ def main():
             print("  DB not available. Ids written to: %s" % cleanup_ids_file)
             print("  Run vod_cleanup.py --ids-file %s on the main DB server." % cleanup_ids_file)
         else:
-            mv, ep, sr, bq = db_cleanup_ids(_db_conn, cleanup_ids, cats, dry_run=not a.apply)
+            mv, ep, sr, bq = db_cleanup_ids(_db_conn, cleanup_ids, cats, stamp, dry_run=not a.apply)
             print("  Movies: %d   Episodes: %d   Series fully removed: %d" % (mv, ep, sr))
             if bq:
                 for bname, cnt in sorted(bq.items()):
@@ -2087,6 +2117,8 @@ def main():
                             except OSError:
                                 pass
                 print("  Dead links removed from movies/: %d" % removed)
+                print("  Backup tables in DB: vod_bk_cleanup_streams_%s, vod_bk_cleanup_episodes_%s" % (stamp, stamp))
+                print("  To undo: INSERT INTO streams SELECT * FROM vod_bk_cleanup_streams_%s;" % stamp)
                 print("  Run setup_cache.php to refresh the panel cache.")
             else:
                 with open(cleanup_ids_file, "w") as fh:
