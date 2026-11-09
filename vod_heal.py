@@ -1749,9 +1749,6 @@ def main():
                     help="interactive: walk through the 'NEEDS YOUR ATTENTION' items from the last run. "
                          "Asks you what to do for each title (pick a folder / mark gone / skip). "
                          "Writes a decisions file you pass to --decisions on the next --apply run.")
-    ap.add_argument("--panel-url", metavar="URL", default="",
-                    help="base URL of your admin panel, e.g. http://1.2.3.4:2053  (default: auto-detect from panel config). "
-                         "After --apply the summary prints direct admin links to repaired titles.")
     ap.add_argument("--panel-ids", metavar="FILE",
                     help="optional: every movie/episode id the PANEL really has (one per line). "
                          "If omitted, ids are read automatically from the panel DB when pymysql is installed. "
@@ -1819,14 +1816,6 @@ def main():
     _db_warn = None
     if not getattr(a, "no_db", False):
         _db_conn, _db_warn = db_connect()
-
-    # --- auto-detect panel URL from the same config (host is the main DB/panel server) ---
-    if not getattr(a, "panel_url", None):
-        try:
-            cfg = read_panel_config()
-            a.panel_url = "http://%s:2053" % cfg["host"]
-        except Exception:
-            pass
 
     if a.undo:
         return 0
@@ -2341,28 +2330,19 @@ def main():
         else:
             print("  ✗ " + check_line)
 
-    # ---- admin verification links ----
+    # ---- repaired ids for quick manual check ----
     if a.apply and check_line and "PASS" in check_line:
         fixed_rows = [r for r in rows if r[0] == "FIXED"]
-        sample = fixed_rows[:6]
-        if sample:
-            base = (getattr(a, "panel_url", "") or "").rstrip("/")
-            print("")
-            if base:
-                print("  Open these in your admin panel to verify the repairs:")
-                for r in sample:
-                    mid = re.match(r"^(\d+)\.", os.path.basename(r[1]))
-                    if mid:
-                        print("    %s/admin/index.php?id=%s&action=stream_edit" % (base, mid.group(1)))
-            else:
-                print("  Verify these repaired stream ids in your admin panel:")
-                for r in sample:
-                    mid = re.match(r"^(\d+)\.", os.path.basename(r[1]))
-                    if mid:
-                        print("    id %-8s  %s  →  %s" % (
-                            mid.group(1),
-                            os.path.basename(r[2])[:40],
-                            os.path.basename(r[3])[:40]))
+        if fixed_rows:
+            ids_sample = []
+            for r in fixed_rows[:6]:
+                mid = re.match(r"^(\d+)\.", os.path.basename(r[1]))
+                if mid:
+                    ids_sample.append(mid.group(1))
+            if ids_sample:
+                print("")
+                print("  Sample repaired ids — search these in your app to verify:")
+                print("    " + "  ".join(ids_sample))
 
     # ---- DB updates ----
     if db_ext_n and a.apply:
@@ -2405,11 +2385,6 @@ def main():
             print("    now: %s" % newn[:90])
         print("")
         if a.apply:
-            base = (getattr(a, "panel_url", "") or "").rstrip("/")
-            if base:
-                print("  Check these in your admin panel, then play them:")
-                for _, i, _, _, _, _ in trial_info:
-                    print("    %s/admin/index.php?id=%s&action=stream_edit" % (base, i))
             print("")
             print("  If they play correctly, run without --trial to repair the rest.")
             print("  If something is wrong:  python3 %s --undo %s" % (me, tsv))
