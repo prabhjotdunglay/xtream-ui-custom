@@ -52,7 +52,174 @@ import sys
 import time
 import unicodedata
 
-VERSION = "2026-11-08-M (update-source SQL, mirror-from B, no-drive orphan removal, drive speed check, folder-delay, ctrl-c, progress heartbeat, fast cleanup lookups, include-working, undo-orphans, panel-ids/orphans, cleanup export, remove-links, trial, find-gone, peek, auto-pick, panel-info, decisions)"
+VERSION = "2026-11-08-N (auto DB connect, integrated cleanup, update-source SQL, mirror-from B, no-drive orphan removal, drive speed check, folder-delay, ctrl-c, progress heartbeat, fast cleanup lookups, include-working, undo-orphans, panel-ids/orphans, cleanup export, remove-links, trial, find-gone, peek, auto-pick, panel-info, decisions)"
+
+# ---------------------------------------------------------------------------
+# Panel config reader + DB helper
+# ---------------------------------------------------------------------------
+CONFIG_CRYPT_KEY = "5709650b0d7806074842c6de575025b1"
+CONFIG_FILE = "/home/xtreamcodes/iptv_xtream_codes/config"
+
+
+def _xor_parse(data: bytes, key: str) -> bytes:
+    kb = key.encode()
+    return bytes(data[i] ^ kb[i % len(kb)] for i in range(len(data)))
+
+
+def read_panel_config(config_path=CONFIG_FILE):
+    """Decode the panel's encrypted config file and return a dict with host/db_user/db_pass/db_name/db_port."""
+    import base64
+    raw = base64.b64decode(open(config_path, "rb").read().strip())
+    return json.loads(_xor_parse(raw, CONFIG_CRYPT_KEY).decode("utf-8"))
+
+
+def db_connect(cfg=None, config_path=CONFIG_FILE):
+    """Return a DB connection using the panel config. Requires pymysql (pip install pymysql)."""
+    try:
+        import pymysql
+    except ImportError:
+        return None, "pymysql not installed (run: pip3 install pymysql)"
+    if cfg is None:
+        try:
+            cfg = read_panel_config(config_path)
+        except Exception as e:
+            return None, "cannot read panel config %s: %s" % (config_path, e)
+    try:
+        conn = pymysql.connect(
+            host=cfg["host"], port=int(cfg.get("db_port", 3306)),
+            user=cfg["db_user"], password=cfg["db_pass"],
+            database=cfg["db_name"], charset="utf8mb4",
+            connect_timeout=10, read_timeout=60, write_timeout=60,
+        )
+        return conn, None
+    except Exception as e:
+        return None, "DB connect failed: %s" % e
+
+
+def db_fetch_ids(conn):
+    """Return set of stream id strings for all movies and episodes in the panel."""
+    with conn.cursor() as c:
+        c.execute("SELECT `id` FROM `streams` WHERE `type` IN (2, 5)")
+        return set(str(r[0]) for r in c.fetchall())
+
+
+def db_fetch_years(conn):
+    """Return dict {stream_id_str: year_int} from streams.release_date for movies/episodes."""
+    years = {}
+    with conn.cursor() as c:
+        c.execute("SELECT `id`, `release_date` FROM `streams` WHERE `type` IN (2, 5) AND `release_date` IS NOT NULL AND `release_date` != ''")
+        for row in c.fetchall():
+            m = re.match(r"^(\d{4})", str(row[1]).strip().strip('"'))
+            if m and 1880 <= int(m.group(1)) <= 2100:
+                years[str(row[0])] = int(m.group(1))
+    return years
+
+
+def db_apply_ext_updates(conn, ext_ids):
+    """Apply target_container updates directly to the panel DB."""
+    if not ext_ids:
+        return 0
+    n = 0
+    with conn.cursor() as c:
+        for ext, idl in sorted(ext_ids.items()):
+            for i in range(0, len(idl), 500):
+                chunk = idl[i:i + 500]
+                c.execute(
+                    "UPDATE `streams` SET `target_container` = %s WHERE `id` IN (%s) AND `type` IN (2,5)"
+                    % ('\'["%s"]\'' % ext, ",".join(chunk))
+                )
+                n += c.rowcount
+    conn.commit()
+    return n
+
+
+def db_apply_source_updates(conn, src_updates):
+    """Apply stream_source path updates directly to the panel DB, keeping the server prefix."""
+    if not src_updates:
+        return 0
+    n = 0
+    with conn.cursor() as c:
+        for sid, path in src_updates.items():
+            body = source_json_body(path)
+            sql = (
+                "UPDATE `streams` SET `stream_source` = "
+                "CONCAT(LEFT(`stream_source`, LOCATE(':', `stream_source`, LOCATE(':', `stream_source`) + 1)), '%s\"]') "
+                "WHERE `id` = %s AND `type` IN (2,5) "
+                "AND `stream_source` LIKE '[\"s:%%:%%\"]' "
+                "AND `stream_source` NOT REGEXP '\"[ ]*,[ ]*\"'" % (sql_lit(body), int(sid))
+            )
+            c.execute(sql)
+            n += c.rowcount
+    conn.commit()
+    return n
+
+
+def db_cleanup_ids(conn, ids, categories, keep_empty_series=False, dry_run=True):
+    """Remove dead VOD entries from the panel DB.  ids = list/set of str.
+    Returns (movies_del, episodes_del, series_del, bouquet_changes) counts."""
+    if not ids:
+        return 0, 0, 0, {}
+    id_set = set(str(i) for i in ids)
+    with conn.cursor() as c:
+        # only type 2 (movie) and type 5 (episode) — never live TV
+        ph = ",".join(["%s"] * len(id_set))
+        c.execute("SELECT `id`, `type` FROM `streams` WHERE `id` IN (%s) AND `type` IN (2,5)" % ph, list(id_set))
+        rows = c.fetchall()
+    movie_ids = [str(r[0]) for r in rows if r[1] == 2]
+    ep_ids    = [str(r[0]) for r in rows if r[1] == 5]
+
+    # find series that would be fully emptied
+    series_del = []
+    if ep_ids:
+        with conn.cursor() as c:
+            ph = ",".join(["%s"] * len(ep_ids))
+            c.execute(
+                "SELECT DISTINCT se.series_id FROM `series_episodes` se "
+                "WHERE se.stream_id IN (%s)" % ph, ep_ids
+            )
+            for (sid,) in c.fetchall():
+                c.execute(
+                    "SELECT COUNT(*) FROM `series_episodes` WHERE series_id = %s "
+                    "AND stream_id NOT IN (%s)" % ("%s", ph),
+                    [sid] + ep_ids
+                )
+                remaining = c.fetchone()[0]
+                if remaining == 0 and not keep_empty_series:
+                    series_del.append(str(sid))
+
+    if dry_run:
+        bq = {}
+        if movie_ids:
+            with conn.cursor() as c:
+                ph = ",".join(["%s"] * len(movie_ids))
+                c.execute(
+                    "SELECT bc.bouquet_id, b.bouquet_name, COUNT(*) FROM `bouquet_channels` bc "
+                    "JOIN `bouquets` b ON b.id = bc.bouquet_id "
+                    "WHERE bc.stream_id IN (%s) GROUP BY bc.bouquet_id, b.bouquet_name" % ph, movie_ids
+                )
+                for bid, bname, cnt in c.fetchall():
+                    bq[bname] = bq.get(bname, 0) + cnt
+        return len(movie_ids), len(ep_ids), len(series_del), bq
+
+    # real delete — one transaction
+    with conn.cursor() as c:
+        all_ids = movie_ids + ep_ids
+        ph_all = ",".join(["%s"] * len(all_ids))
+        if ep_ids:
+            ph_ep = ",".join(["%s"] * len(ep_ids))
+            c.execute("DELETE FROM `series_episodes` WHERE `stream_id` IN (%s)" % ph_ep, ep_ids)
+        if series_del:
+            ph_s = ",".join(["%s"] * len(series_del))
+            c.execute("DELETE FROM `bouquet_channels` WHERE `stream_id` IN (%s)" % ph_s, series_del)
+            c.execute("DELETE FROM `streams_sys` WHERE `stream_id` IN (%s)" % ph_s, series_del)
+            c.execute("DELETE FROM `streams` WHERE `id` IN (%s)" % ph_s, series_del)
+        if all_ids:
+            c.execute("DELETE FROM `bouquet_channels` WHERE `stream_id` IN (%s)" % ph_all, all_ids)
+            c.execute("DELETE FROM `streams_sys` WHERE `stream_id` IN (%s)" % ph_all, all_ids)
+            c.execute("DELETE FROM `streams` WHERE `id` IN (%s) AND `type` IN (2,5)" % ph_all, all_ids)
+    conn.commit()
+    return len(movie_ids), len(ep_ids), len(series_del), {}
+
 
 def sql_lit(s):
     """MySQL string literal body (default sql_mode: backslash is an escape character)."""
@@ -1247,7 +1414,7 @@ def main():
     ap.add_argument("--export-cleanup", action="store_true",
                     help="READ-ONLY: write the list of ids that are still broken and safe to remove from the panel")
     ap.add_argument("--cleanup-categories", default="gone,missing-file,marked-gone",
-                    help="which groups --export-cleanup includes (default gone,missing-file,marked-gone; "
+                    help="which groups --export-cleanup / --cleanup includes (default gone,missing-file,marked-gone; "
                          "others: lookalike, double-episode, several-folders, daily)")
     ap.add_argument("--remove-links", metavar="IDS_FILE",
                     help="remove the DEAD links in movies/ for the ids in this file (dry run unless --apply)")
@@ -1268,7 +1435,8 @@ def main():
     ap.add_argument("--panel-info", metavar="FILE",
                     help="optional 'stream_id<TAB>release_year' export from the panel DB. With it, a title-only "
                          "match is accepted automatically when the year fits, and refused when it does not "
-                         "(remakes, revivals). See the SQL in the instructions.")
+                         "(remakes, revivals). If omitted, years are read automatically from the panel DB when "
+                         "pymysql is installed.")
     ap.add_argument("--decisions", metavar="WORKSHEET",
                     help="the worksheet_*.tsv you filled in. In its 'decision' column put: a folder path "
                          "(look for the files there), OK (accept the one clean suggestion), GONE (deleted "
@@ -1280,11 +1448,17 @@ def main():
     ap.add_argument("--only-ids", metavar="FILE_OR_LIST",
                     help="repair only these stream ids (a file, or comma-separated)")
     ap.add_argument("--panel-ids", metavar="FILE",
-                    help="optional: every movie/episode id the PANEL really has (one per line, from the database: "
-                         "SELECT id FROM streams WHERE type IN (2,5)). Links for ids not in it are leftovers from "
-                         "deleted titles: they are counted separately and never repaired")
+                    help="optional: every movie/episode id the PANEL really has (one per line). "
+                         "If omitted, ids are read automatically from the panel DB when pymysql is installed. "
+                         "Links for ids not in the panel are counted as leftovers and never repaired.")
+    ap.add_argument("--no-db", action="store_true",
+                    help="do not connect to the panel DB automatically (skip auto id/year load and inline DB updates)")
+    ap.add_argument("--cleanup", action="store_true",
+                    help="after --apply: show dead titles and (with --apply) remove them from the panel DB and "
+                         "delete their links. Replaces the separate vod_cleanup.py + --export-cleanup + --remove-links steps. "
+                         "Dry run by default unless --apply is also set.")
     ap.add_argument("--remove-orphans", action="store_true",
-                    help="with --panel-ids: remove the DEAD leftover links (dry run unless --apply). Working "
+                    help="with panel-ids (auto or --panel-ids): remove the DEAD leftover links (dry run unless --apply). Working "
                          "leftovers and links younger than --orphan-min-age-days are kept")
     ap.add_argument("--mirror-from", metavar="FILE",
                     help="B's current links (made on B's LB with: find <movies dir> -type l -printf '%%p\\t%%l\\n'). "
@@ -1334,6 +1508,12 @@ def main():
     ap.add_argument("--undo", metavar="LOGFILE", help="restore links changed by a previous --apply run")
     a = ap.parse_args()
     a.add_ext_link = not a.no_ext_link
+
+    # --- auto DB connect (reads panel config; silent if pymysql not installed or --no-db) ---
+    _db_conn = None
+    _db_warn = None
+    if not getattr(a, "no_db", False):
+        _db_conn, _db_warn = db_connect()
 
     if a.undo:
         do_undo(a.undo)
@@ -1413,6 +1593,12 @@ def main():
             print("cannot read --panel-info file: %s" % e)
             return 1
         print("panel release years loaded for %d titles" % len(panel_year))
+    elif _db_conn is not None:
+        try:
+            panel_year = db_fetch_years(_db_conn)
+            print("panel release years loaded from DB: %d titles" % len(panel_year))
+        except Exception as e:
+            print("WARNING: could not load panel years from DB: %s" % e)
     panel_ids = None
     if a.panel_ids:
         try:
@@ -1425,6 +1611,15 @@ def main():
             print("STOPPED: the --panel-ids file has only %d ids - that is not a real export. Nothing was changed." % len(panel_ids))
             return 1
         print("panel ids loaded: %d titles" % len(panel_ids))
+    elif _db_conn is not None:
+        try:
+            panel_ids = db_fetch_ids(_db_conn)
+            print("panel ids loaded from DB: %d titles" % len(panel_ids))
+        except Exception as e:
+            print("WARNING: could not load panel ids from DB: %s" % e)
+    else:
+        if _db_warn:
+            print("NOTE: %s — panel ids not loaded (leftovers will not be detected)" % _db_warn)
     if a.remove_orphans and panel_ids is None:
         print("--remove-orphans needs --panel-ids")
         return 1
@@ -1654,20 +1849,45 @@ def main():
         f.write(",".join(ids) + "\n")
 
     sqlfile = ""
+    db_ext_n = 0
     if ext_ids:
-        sqlfile = os.path.join(a.log_dir, "ext_updates_%s.sql" % stamp)
-        with open(sqlfile, "w") as f:
-            f.write("-- Run on the PANEL DATABASE that owns these stream ids (not on the LB).\n")
-            f.write("-- Makes streams.target_container match the new file extension.\n")
-            for ext, idl in sorted(ext_ids.items()):
-                for i in range(0, len(idl), 1000):
-                    chunk = idl[i:i + 1000]
-                    f.write("UPDATE `streams` SET `target_container` = '[\"%s\"]' WHERE `id` IN (%s);\n"
-                            % (ext, ",".join(chunk)))
+        if _db_conn is not None and a.apply:
+            try:
+                db_ext_n = db_apply_ext_updates(_db_conn, ext_ids)
+            except Exception as e:
+                print("WARNING: could not apply target_container updates to DB: %s" % e)
+                # fall back to writing the SQL file
+                sqlfile = os.path.join(a.log_dir, "ext_updates_%s.sql" % stamp)
+                with open(sqlfile, "w") as f:
+                    f.write("-- Run on the PANEL DATABASE that owns these stream ids (not on the LB).\n")
+                    f.write("-- Makes streams.target_container match the new file extension.\n")
+                    for ext, idl in sorted(ext_ids.items()):
+                        for i in range(0, len(idl), 1000):
+                            chunk = idl[i:i + 1000]
+                            f.write("UPDATE `streams` SET `target_container` = '[\"%s\"]' WHERE `id` IN (%s);\n"
+                                    % (ext, ",".join(chunk)))
+        else:
+            sqlfile = os.path.join(a.log_dir, "ext_updates_%s.sql" % stamp)
+            with open(sqlfile, "w") as f:
+                f.write("-- Run on the PANEL DATABASE that owns these stream ids (not on the LB).\n")
+                f.write("-- Makes streams.target_container match the new file extension.\n")
+                for ext, idl in sorted(ext_ids.items()):
+                    for i in range(0, len(idl), 1000):
+                        chunk = idl[i:i + 1000]
+                        f.write("UPDATE `streams` SET `target_container` = '[\"%s\"]' WHERE `id` IN (%s);\n"
+                                % (ext, ",".join(chunk)))
 
     srcfile = ""
-    if a.update_source and src_updates and a.apply:
-        srcfile = write_source_sql(a.log_dir, stamp, src_updates)
+    db_src_n = 0
+    if src_updates and a.apply:
+        if _db_conn is not None:
+            try:
+                db_src_n = db_apply_source_updates(_db_conn, src_updates)
+            except Exception as e:
+                print("WARNING: could not apply stream_source updates to DB: %s" % e)
+                srcfile = write_source_sql(a.log_dir, stamp, src_updates)
+        elif a.update_source:
+            srcfile = write_source_sql(a.log_dir, stamp, src_updates)
 
     # ---- the "needs your attention" list, in plain English ----
     attn = [r for r in rows if r[0] in ("UNRESOLVED", "ERROR", "SKIPPED_ID", "SKIPPED_EXT")]
@@ -1792,10 +2012,14 @@ def main():
     print("  heal_%s.tsv              <- every link and what happened (also used for --undo)" % stamp)
     if sqlfile:
         print("  %s  <- run on the PANEL database after applying" % os.path.basename(sqlfile))
+    elif db_ext_n and a.apply:
+        print("  target_container updated in panel DB: %d rows" % db_ext_n)
     if srcfile:
         print("  %s  <- (optional) updates 'Movie Path / URL' in admin; run on the PANEL database;" %
               os.path.basename(srcfile))
         print("      it backs up the old values first; undo with source_undo_%s.sql" % stamp)
+    elif db_src_n and a.apply:
+        print("  stream_source (Movie Path / URL) updated in panel DB: %d rows" % db_src_n)
     if trial_info:
         trial_file = os.path.join(a.log_dir, "trial_%s.tsv" % stamp)
         with open(trial_file, "w", encoding="utf-8") as fh:
@@ -1815,6 +2039,60 @@ def main():
         print("Play these in the panel / your app. If they are fine, run the same command again WITHOUT")
         print("--trial to repair the rest. If not, undo with:  python3 %s --undo %s" % (os.path.abspath(sys.argv[0]), tsv))
     print("Took %.0fs." % (time.time() - t0))
+
+    # --- integrated --cleanup ---
+    if a.cleanup:
+        cleanup_ids_file = os.path.join(a.log_dir, "cleanup_ids_%s.txt" % stamp)
+        # reuse export_cleanup logic inline
+        all_rows_for_cleanup = rows
+        cats = set(a.cleanup_categories.split(","))
+        cleanup_ids = []
+        for r in all_rows_for_cleanup:
+            if r[0] not in ("UNRESOLVED", "ERROR"):
+                continue
+            why = explain(r[4])
+            if why not in cats:
+                continue
+            mid = re.match(r"^(\d+)\.", os.path.basename(r[1]))
+            if mid:
+                cleanup_ids.append(mid.group(1))
+        cleanup_ids = sorted(set(cleanup_ids), key=int)
+        print("")
+        print("=" * 66)
+        print("CLEANUP  (%s)" % ("APPLIED" if a.apply else "DRY RUN - add --apply to commit"))
+        print("  Dead titles to remove: %d  (categories: %s)" % (len(cleanup_ids), a.cleanup_categories))
+        if not cleanup_ids:
+            print("  Nothing to clean up.")
+        elif _db_conn is None:
+            with open(cleanup_ids_file, "w") as fh:
+                fh.write(",".join(cleanup_ids) + "\n")
+            print("  DB not available. Ids written to: %s" % cleanup_ids_file)
+            print("  Run vod_cleanup.py --ids-file %s on the main DB server." % cleanup_ids_file)
+        else:
+            mv, ep, sr, bq = db_cleanup_ids(_db_conn, cleanup_ids, cats, dry_run=not a.apply)
+            print("  Movies: %d   Episodes: %d   Series fully removed: %d" % (mv, ep, sr))
+            if bq:
+                for bname, cnt in sorted(bq.items()):
+                    print("    bouquet '%s': -%d" % (bname, cnt))
+            if a.apply:
+                # remove the dead links
+                removed = 0
+                for sid in cleanup_ids:
+                    for ext in VIDEO_EXT:
+                        lp = os.path.join(a.movies_dir, sid + ext)
+                        if os.path.lexists(lp):
+                            try:
+                                os.unlink(lp)
+                                removed += 1
+                            except OSError:
+                                pass
+                print("  Dead links removed from movies/: %d" % removed)
+                print("  Run setup_cache.php to refresh the panel cache.")
+            else:
+                with open(cleanup_ids_file, "w") as fh:
+                    fh.write(",".join(cleanup_ids) + "\n")
+                print("  Ids written to: %s" % cleanup_ids_file)
+                print("  Add --apply to commit the cleanup.")
 
     # keep 30 days of logs
     cutoff = time.time() - 30 * 86400
