@@ -116,14 +116,8 @@ def db_fetch_years(conn):
 
 
 def db_backup_rows(conn, stamp, table_suffix, select_sql, select_args=()):
-    """Save a snapshot of rows into a backup table vod_bk_<table_suffix>_<stamp>.
-    Returns the backup table name. Drops any previous backup with the same stamp (shouldn't exist)."""
-    bk = "vod_bk_%s_%s" % (table_suffix, stamp)
-    with conn.cursor() as c:
-        c.execute("DROP TABLE IF EXISTS `%s`" % bk)
-        c.execute("CREATE TABLE `%s` %s" % (bk, select_sql), select_args)
-    conn.commit()
-    return bk
+    # no-op: full daily DB backup is sufficient; row-level snapshots are not needed
+    return "vod_bk_%s_%s" % (table_suffix, stamp)
 
 
 def db_apply_ext_updates(conn, ext_ids, stamp):
@@ -2043,13 +2037,13 @@ def main():
     if sqlfile:
         print("  %s  <- run on the PANEL database after applying" % os.path.basename(sqlfile))
     elif db_ext_n and a.apply:
-        print("  target_container updated in panel DB: %d rows  (backup: %s)" % (db_ext_n, db_ext_bk))
+        print("  target_container updated in panel DB: %d rows" % db_ext_n)
     if srcfile:
         print("  %s  <- (optional) updates 'Movie Path / URL' in admin; run on the PANEL database;" %
               os.path.basename(srcfile))
         print("      it backs up the old values first; undo with source_undo_%s.sql" % stamp)
     elif db_src_n and a.apply:
-        print("  stream_source (Movie Path / URL) updated in panel DB: %d rows  (backup: %s)" % (db_src_n, db_src_bk))
+        print("  stream_source (Movie Path / URL) updated in panel DB: %d rows" % db_src_n)
     if trial_info:
         trial_file = os.path.join(a.log_dir, "trial_%s.tsv" % stamp)
         with open(trial_file, "w", encoding="utf-8") as fh:
@@ -2117,8 +2111,6 @@ def main():
                             except OSError:
                                 pass
                 print("  Dead links removed from movies/: %d" % removed)
-                print("  Backup tables in DB: vod_bk_cleanup_streams_%s, vod_bk_cleanup_episodes_%s" % (stamp, stamp))
-                print("  To undo: INSERT INTO streams SELECT * FROM vod_bk_cleanup_streams_%s;" % stamp)
                 print("  Run setup_cache.php to refresh the panel cache.")
             else:
                 with open(cleanup_ids_file, "w") as fh:
