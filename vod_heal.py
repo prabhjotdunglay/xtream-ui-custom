@@ -1820,14 +1820,15 @@ def main():
     if not getattr(a, "no_db", False):
         _db_conn, _db_warn = db_connect()
 
-    # --- auto-detect panel URL if not given ---
-    if not getattr(a, "panel_url", None) and _db_conn is not None:
+    # --- auto-detect panel URL from the same config (host is the main DB/panel server) ---
+    if not getattr(a, "panel_url", None):
         try:
             cfg = read_panel_config()
             a.panel_url = "http://%s:2053" % cfg["host"]
         except Exception:
             pass
-        do_undo(a.undo)
+
+    if a.undo:
         return 0
     if a.undo_orphans:
         n = bad = 0
