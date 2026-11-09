@@ -2310,6 +2310,25 @@ def main():
         print("    ✓ Repaired            %d" % fixed)
     else:
         print("    → CAN BE REPAIRED     %d  ← add --apply to fix these" % fixed)
+        if fixed > 0:
+            would_fix = [r for r in rows if r[0] == "WOULD_FIX"]
+            print("")
+            print("  These %d links will be fixed:" % len(would_fix))
+            for r in would_fix:
+                mid = re.match(r"^(\d+)\.", os.path.basename(r[1]))
+                sid = mid.group(1) if mid else "?"
+                old_name = os.path.basename(r[2])
+                new_name = os.path.basename(r[3])
+                note = ""
+                if r[4] and "EXT_MISMATCH" in r[4]:
+                    note = "  [ext change]"
+                elif r[4] and "moved" in r[4]:
+                    note = "  [folder moved]"
+                if old_name == new_name:
+                    print("    id %-9s  %s  (same name, folder moved)" % (sid, old_name[:60]))
+                else:
+                    print("    id %-9s  %s" % (sid, old_name[:55]))
+                    print("               →  %s%s" % (new_name[:55], note))
     if held:
         print("    ⏸ Held back           %d  (not in this %s; run again without --trial to do them)"
               % (held, "trial" if a.trial else "selection"))
