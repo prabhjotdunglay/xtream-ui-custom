@@ -10,7 +10,7 @@
 #   - GitHub release URLs for prabhjotdunglay/xtream-ui-custom
 #   - Keeps the pool-of-threads MariaDB my.cnf, dynamic buffer pool sizing,
 #     UFW handling, tmpfs fstab entries, init.d + @reboot cron, and the
-#     :25500 admin nginx server block.
+#     :8880 admin nginx server block (shipped in nginx.conf; ssl on :2053).
 #   - Parity with the reference builds (see .agents/tasks/parity/plan.md):
 #       * ISP lookup nginx server block on :8805 (MAIN and LB); access restricted to 127.0.0.1 via allow/deny in both locations
 #       * odin_blocker table (login brute-force auto-block)
@@ -119,13 +119,12 @@ def prepare(rType="MAIN"):
     if ufw_active:
         printc("UFW Firewall detected active!", col.BRIGHT_YELLOW)
         printc("[1] Disable UFW (recommended for performance)", col.WHITE)
-        printc("[2] Allow required ports only (22, 80, 443, 25461, 25462, 25463, 25500, 7999, 31210)", col.WHITE)
+        printc("[2] Allow required ports only (22, 80, 443, 8080, 8880, 2053, 25462, 7999, 31210)", col.WHITE)
         rUFW = input("  Choice [1/2] (default: 1): ").strip() or "1"
         if rUFW == "2":
-            for port in ["22", "80", "443", "25461", "25462", "25463", "31210"]:
+            for port in ["22", "80", "443", "8080", "8880", "2053", "25462", "31210"]:
                 os.system("ufw allow %s > /dev/null 2>&1" % port)
             if rType.upper() == "MAIN":
-                os.system("ufw allow 25500 > /dev/null 2>&1")
                 os.system("ufw allow 7999 > /dev/null 2>&1")
             printc("UFW: required ports allowed", col.GREEN)
         else:
@@ -312,7 +311,7 @@ def mysql(rUsername, rPassword):  # handles db setup
                 # table (type/value), not in `settings`, so seed them there. Seed a
                 # current-ish geolite2_version so no GeoLite "update available" nag shows.
                 os.system('mysql -u root%s -e "USE xtream_iptvpro; CREATE TABLE IF NOT EXISTS admin_settings (type varchar(255) NOT NULL, value text, PRIMARY KEY (type)) ENGINE=InnoDB DEFAULT CHARSET=latin1; REPLACE INTO admin_settings (type, value) VALUES (\'panel_version\', \'46\'), (\'geolite2_version\', \'20210223\');" > /dev/null' % rExtra)
-                os.system('mysql -u root%s -e "USE xtream_iptvpro; REPLACE INTO streaming_servers (id, server_name, domain_name, server_ip, vpn_ip, ssh_password, ssh_port, diff_time_main, http_broadcast_port, total_clients, system_os, network_interface, latency, status, enable_geoip, geoip_countries, last_check_ago, can_delete, server_hardware, total_services, persistent_connections, rtmp_port, geoip_type, isp_names, isp_type, enable_isp, boost_fpm, http_ports_add, network_guaranteed_speed, https_broadcast_port, https_ports_add, whitelist_ips, watchdog_data, timeshift_only) VALUES (1, \'Main Server\', \'\', \'%s\', \'\', NULL, NULL, 0, 25461, 1000, \'%s\', \'eth0\', 0, 1, 0, \'[]\', 0, 0, \'{}\', 3, 0, 25462, \'low_priority\', \'\', \'low_priority\', 0, 1, \'\', 1000, 25463, \'\', \'[\"127.0.0.1\",\"\"]\', \'{}\', 0);" > /dev/null' % (rExtra, getIP(), getVersion()))
+                os.system('mysql -u root%s -e "USE xtream_iptvpro; REPLACE INTO streaming_servers (id, server_name, domain_name, server_ip, vpn_ip, ssh_password, ssh_port, diff_time_main, http_broadcast_port, total_clients, system_os, network_interface, latency, status, enable_geoip, geoip_countries, last_check_ago, can_delete, server_hardware, total_services, persistent_connections, rtmp_port, geoip_type, isp_names, isp_type, enable_isp, boost_fpm, http_ports_add, network_guaranteed_speed, https_broadcast_port, https_ports_add, whitelist_ips, watchdog_data, timeshift_only) VALUES (1, \'Main Server\', \'\', \'%s\', \'\', NULL, NULL, 0, 8080, 1000, \'%s\', \'eth0\', 0, 1, 0, \'[]\', 0, 0, \'{}\', 3, 0, 25462, \'low_priority\', \'\', \'low_priority\', 0, 1, \'\', 1000, 443, \'\', \'[\"127.0.0.1\",\"\"]\', \'{}\', 0);" > /dev/null' % (rExtra, getIP(), getVersion()))
                 os.system('mysql -u root%s -e "USE xtream_iptvpro; REPLACE INTO reg_users (id, username, password, email, member_group_id, verified, status) VALUES (1, \'admin\', \'\\$6\\$rounds=20000\\$xtreamcodes\\$XThC5OwfuS0YwS4ahiifzF14vkGbGsFF1w7ETL4sRRC5sOrAWCjWvQJDromZUQoQuwbAXAFdX3h3Cp3vqulpS0\', \'admin@website.com\', 1, 1, 1);" > /dev/null'  % rExtra)
                 os.system('mysql -u root%s -e "CREATE USER \'%s\'@\'%%\' IDENTIFIED BY \'%s\'; GRANT ALL PRIVILEGES ON xtream_iptvpro.* TO \'%s\'@\'%%\' WITH GRANT OPTION; GRANT SELECT, LOCK TABLES ON *.* TO \'%s\'@\'%%\';FLUSH PRIVILEGES;" > /dev/null' % (rExtra, rUsername, rPassword, rUsername, rUsername))
                 os.system('mysql -u root%s -e "USE xtream_iptvpro; CREATE TABLE IF NOT EXISTS dashboard_statistics (id int(11) NOT NULL AUTO_INCREMENT, type varchar(16) NOT NULL DEFAULT \'\', time int(16) NOT NULL DEFAULT \'0\', count int(16) NOT NULL DEFAULT \'0\', PRIMARY KEY (id)) ENGINE=InnoDB DEFAULT CHARSET=latin1; INSERT INTO dashboard_statistics (type, time, count) VALUES(\'conns\', UNIX_TIMESTAMP(), 0),(\'users\', UNIX_TIMESTAMP(), 0);\" > /dev/null' % rExtra)
@@ -514,14 +513,14 @@ def insertNginxBlock(rPath, rGuard, rBlock):
     return True
 
 def modifyNginx(rAdmin=True):
-    # rAdmin=True: MAIN (admin :25500 + ISP :8805). rAdmin=False: LB (ISP :8805 only).
+    # rAdmin=True: MAIN (admin :8880 + ISP :8805; both already shipped in nginx.conf). rAdmin=False: LB (ISP :8805 only).
     printc("Modifying Nginx")
     rPath = "/home/xtreamcodes/iptv_xtream_codes/nginx/conf/nginx.conf"
 
     if rAdmin:
         new_server_block = """
     server {
-        listen 25500;
+        listen 8880;
         index index.php index.html index.htm;
         root /home/xtreamcodes/iptv_xtream_codes/admin/;
 
@@ -541,7 +540,7 @@ def modifyNginx(rAdmin=True):
         }
     }
 """
-        insertNginxBlock(rPath, "listen 25500;", new_server_block)
+        insertNginxBlock(rPath, "listen 8880;", new_server_block)
 
     # ISP lookup endpoint: wwwdir/includes/streaming.php calls http://api.xtream-codes.com:8805/api.php
     # (api.xtream-codes.com is mapped to 127.0.0.1 in /etc/hosts), so it must listen locally.
@@ -576,6 +575,50 @@ def modifyNginx(rAdmin=True):
 """
     if insertNginxBlock(rPath, "listen 8805;", isp_server_block) or "listen 8805;" in open(rPath).read():
         rApplied.append("nginx ISP :8805 block")
+
+def ensureCloudCert(rConf="/home/xtreamcodes/iptv_xtream_codes/nginx/conf"):
+    # nginx.conf references cloud_ssl_cer.cer / cloud_ssl_key.key (relative to nginx/conf).
+    # nginx will not start without them, so create a self-signed placeholder if BOTH are missing.
+    # Existing files are never overwritten. Returns "generated", "fallback", "present", "partial" or "failed".
+    rCer = os.path.join(rConf, "cloud_ssl_cer.cer")
+    rKey = os.path.join(rConf, "cloud_ssl_key.key")
+    rHasCer, rHasKey = os.path.exists(rCer), os.path.exists(rKey)
+    if rHasCer and rHasKey: return "present"
+    if rHasCer or rHasKey:
+        printc("Only one of cloud_ssl_cer.cer / cloud_ssl_key.key exists - NOT overwriting. nginx will not start until both are present!", col.BRIGHT_RED)
+        return "partial"
+    rResult = "failed"
+    if shutil.which("openssl"):
+        rRet = subprocess.call(["openssl", "req", "-x509", "-nodes", "-newkey", "rsa:2048", "-days", "3650", "-subj", "/CN=localhost", "-keyout", rKey, "-out", rCer], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        if rRet == 0 and os.path.exists(rCer) and os.path.exists(rKey): rResult = "generated"
+    if rResult != "generated":
+        for rFile in (rCer, rKey):
+            if os.path.exists(rFile): os.remove(rFile)
+        rSrcCer, rSrcKey = os.path.join(rConf, "server.crt"), os.path.join(rConf, "server.key")
+        if os.path.exists(rSrcCer) and os.path.exists(rSrcKey):
+            shutil.copy(rSrcCer, rCer)
+            shutil.copy(rSrcKey, rKey)
+            rResult = "fallback"
+            printc("openssl failed/missing: copied shipped server.crt/server.key (PUBLIC key, replace ASAP)", col.BRIGHT_RED)
+        else:
+            printc("Could not create placeholder certificate!", col.BRIGHT_RED)
+            return "failed"
+    os.chmod(rKey, 0o600)
+    try:
+        shutil.chown(rCer, "xtreamcodes", "xtreamcodes")
+        shutil.chown(rKey, "xtreamcodes", "xtreamcodes")
+    except (LookupError, PermissionError, OSError): pass
+    return rResult
+
+CERT_REMINDER = [
+    "Temporary self-signed SSL certificate created.",
+    "Replace with your Cloudflare Origin certificate:",
+    "/home/xtreamcodes/iptv_xtream_codes/nginx/conf/cloud_ssl_cer.cer",
+    "/home/xtreamcodes/iptv_xtream_codes/nginx/conf/cloud_ssl_key.key",
+    "then run start_services.sh to restart.",
+    "Cloudflare SSL mode Full works with the placeholder;",
+    "Full (strict) needs the real certificate.",
+]
 
 if __name__ == "__main__":
     try: rVersion = os.popen('lsb_release -sr').read().strip()
@@ -612,6 +655,11 @@ if __name__ == "__main__":
                 encrypt(rHost, rUsername, rPassword, rDatabase, rServerID, rPort)
                 configure()
                 modifyNginx(rType.upper() == "MAIN")
+                rCert = None
+                if rType.upper() == "MAIN":
+                    rCert = ensureCloudCert()
+                    if rCert in ("generated", "fallback"):
+                        for rLine in CERT_REMINDER: printc(rLine, col.BRIGHT_YELLOW)
                 if rType.upper() == "MAIN":
                     finalize()
                 start()
@@ -620,13 +668,15 @@ if __name__ == "__main__":
                 printc("Installation completed!", col.GREEN, 2)
                 if rType.upper() == "MAIN":
                     printc("Please store your MySQL password: %s" % rPassword, col.BRIGHT_YELLOW)
-                    printc("Admin UI Wan IP: http://%s:25500" % getIP(), col.BRIGHT_YELLOW)
+                    printc("Admin UI Wan IP: http://%s:8880 (https on 2053)" % getIP(), col.BRIGHT_YELLOW)
                     printc("Admin UI default login is admin/admin", col.BRIGHT_YELLOW)
                     printc("Credentials saved to /root/credentials.txt", col.BRIGHT_YELLOW)
                     rFile = open("/root/credentials.txt", "w")
                     rFile.write("MySQL password: %s\n" % rPassword)
-                    rFile.write("Admin UI Wan IP: http://%s:25500\n" % getIP())
+                    rFile.write("Admin UI Wan IP: http://%s:8880 (https on 2053)\n" % getIP())
                     rFile.write("Admin UI default login is admin/admin\n")
+                    if rCert in ("generated", "fallback"):
+                        rFile.write("\nNOTE: " + " ".join(CERT_REMINDER) + "\n")
                     rFile.close()
                 printc("Installation done. It is recommended to REBOOT the server now: reboot", col.BRIGHT_YELLOW)
             else: printc("Installation cancelled", col.BRIGHT_RED)
