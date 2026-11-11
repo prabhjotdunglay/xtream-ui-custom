@@ -62,8 +62,8 @@ rm -rf install.py && wget -qO install.py https://raw.githubusercontent.com/prabh
 ```
 
 The installer is 24.04-ONLY and refuses any other release. It prompts for `MAIN` or `LB`, sets up
-MariaDB (MAIN), writes the encrypted `config`, configures tmpfs/init.d/cron, adds the `:25500`
-admin nginx server block, and starts services.
+MariaDB (MAIN), writes the encrypted `config`, configures tmpfs/init.d/cron, creates a placeholder SSL cert if
+needed (see §Custom nginx.conf), and starts services (the `:8880` admin server ships in `nginx.conf`).
 
 ---
 
@@ -88,8 +88,8 @@ admin nginx server block, and starts services.
   - `nginx_rtmp/sbin/nginx_rtmp`: 1.16.1 → **1.27.0 built with nginx-http-flv-module + OpenSSL 3.3.1**,
     exec bit set.
   - `bin/ffmpeg` unchanged (still the 2023 Lavc60 build).
-- **nginx configs byte-identical** between BASE and redss (`diff -q` empty for both
-  `nginx/conf/nginx.conf` and `nginx_rtmp/conf/nginx.conf`) → the newer binaries are drop-in.
+- **nginx configs:** originally byte-identical between BASE and redss. BASE `nginx/conf/nginx.conf` now
+  deliberately differs (custom config, see §Custom nginx.conf); `nginx_rtmp` differs only in the hook port (8080).
 - **php.ini:** IonCube line commented (`;zend_extension=ioncube_loader_lin_7.2.so`); only
   `zend_extension=opcache.so` remains active; `memory_limit = 2048M` preserved; commented opt-in
   JIT lines added.
@@ -115,7 +115,7 @@ Full evidence is in `.agents/tasks/verification.md`.
 ### User smoke-test steps (do these on a fresh Ubuntu 24.04 server)
 1. Run the one-liner in §3 and choose `MAIN`.
 2. Confirm MariaDB came up and `start_services.sh` launched nginx, nginx_rtmp, and the 3 php-fpm pools.
-3. Browse `http://SERVER_IP:25500` and log in with `admin` / `admin`.
+3. Browse `http://SERVER_IP:8880` and log in with `admin` / `admin`.
 4. Add a stream and confirm it plays.
 5. Confirm the ODIN/line-theft whitelist still blocks after the configured wrong-attempt threshold.
 
@@ -234,8 +234,8 @@ Scripts / new files:
 - `start_services.sh` — added `rm -f php/*.pid` before start; 3 pool launches now use absolute
   `/sbin/start-stop-daemon`; BASE log reset + balancer-json cleanup kept.
 - `install.py` — **new** 24.04-only, Python-3-clean hosted installer (no IonCube; placeholder repo
-  URLs; pool-of-threads my.cnf; dynamic buffer pool; UFW handling; tmpfs/init.d/cron; :25500 admin
-  server block; robust no-op index.php sed). This change also added: `rMaxmindKey = ""` placeholder;
+  URLs; pool-of-threads my.cnf; dynamic buffer pool; UFW handling; tmpfs/init.d/cron; :8880 admin
+  server (in the shipped nginx.conf); robust no-op index.php sed). This change also added: `rMaxmindKey = ""` placeholder;
   `admin_settings` seed of `panel_version='46'` + `geolite2_version='20210223'` (build date of the shipped mmdb; replaced by the first update) in `mysql()`; a weekly
   GeoLite2 cron in `configure()`.
 - `crons/geolite_update.php` — **new** MaxMind GeoLite2-City updater (reads key from env /
@@ -453,3 +453,25 @@ NOTE: lint on the mac host used system PHP 8.2 as a proxy; the canonical PHP 7.4
 Not verifiable from the build machine (macOS): `nginx -t`, `php-fpm -t`, `ldd`, and the runtime
 behaviour of every installer step. Server checks: `.agents/tasks/parity/server-commands.md`.
 `sub_FINAL.zip` (LB) does not exist yet.
+
+## Custom nginx.conf (new installs only)
+BASE `nginx/conf/nginx.conf` is the operator's customised config and is one identical file for every
+install (`server_name _;` on the stream and panel blocks). Existing installs are not touched.
+- **Default ports:** streams HTTP 8080 + HTTPS 443; panel (admin) HTTP 8880 + HTTPS 2053; ISP 8805
+  (localhost only); RTMP 25462 (unchanged); MariaDB 7999. The old 25461, 25463 and 25500 are gone from the
+  installer (UFW option, printed URLs, `streaming_servers` ports 8080/443) and from `nginx_rtmp` hooks
+  (now `127.0.0.1:8080`).
+- **Panel block** has `index index.php index.html index.htm;` so `/` loads.
+- **ISP block:** `allow 127.0.0.1; deny all;` in both `location /` and `location ~ \.php$`.
+- **TLS:** `ssl_protocols TLSv1.2 TLSv1.3;` on both ssl listeners (443, 2053).
+- **Includes:** `nginx/conf/blacklist.conf` (shipped, absolute path include in stream and panel blocks).
+- **Certificates:** the config uses `cloud_ssl_cer.cer` / `cloud_ssl_key.key` in `nginx/conf/`. None are shipped.
+  If both are missing the installer (MAIN) creates a self-signed placeholder (`openssl req -x509`, 10 years,
+  CN=localhost, key mode 600, owner xtreamcodes), prints a reminder and writes it to `/root/credentials.txt`.
+  Existing files are never overwritten; if only one exists it warns. Without openssl it falls back to the
+  shipped `server.crt`/`server.key` (public key, replace ASAP).
+  To replace: copy the Cloudflare Origin certificate and key over those two files, then run
+  `/home/xtreamcodes/iptv_xtream_codes/start_services.sh`.
+- **Cloudflare SSL mode:** Full works with the placeholder; Full (strict) needs the real Origin certificate (526 otherwise).
+- **origin-pull-ca.pem** is unused (no `ssl_client_certificate` / `ssl_verify_client`).
+- `smoke_test.py` expects ports 8080, 443, 8880, 2053, 8805, 7999.

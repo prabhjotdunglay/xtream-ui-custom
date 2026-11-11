@@ -2,7 +2,7 @@
 """
 Read-only smoke test for the custom Xtream-UI panel. Run on the server:
 
-    python3 smoke_test.py                          # admin / admin on :25500
+    python3 smoke_test.py                          # admin / admin on :8880
     python3 smoke_test.py --pass 'NEWPASSWORD'
     python3 smoke_test.py --line user:pass         # also checks the client playlist
 
@@ -14,8 +14,8 @@ those requests wrote to nginx's error.log (grouped per file).
 import argparse, http.cookiejar, os, re, subprocess, sys, time, urllib.parse, urllib.request, urllib.error
 
 ap = argparse.ArgumentParser()
-ap.add_argument("--url", default="http://127.0.0.1:25500")
-ap.add_argument("--client", default="http://127.0.0.1:25461")
+ap.add_argument("--url", default="http://127.0.0.1:8880")
+ap.add_argument("--client", default="http://127.0.0.1:8080")
 ap.add_argument("--dir", default="/home/xtreamcodes/iptv_xtream_codes")
 ap.add_argument("--user", default="admin")
 ap.add_argument("--pass", dest="pw", default="admin")
@@ -49,7 +49,7 @@ for name, needle in wanted.items():
     n = sum(1 for l in ps.splitlines() if needle in l and "grep" not in l)
     (ok if n >= 1 else bad)("%s running (%d process%s)" % (name, n, "" if n == 1 else "es"))
 listen = run("ss -ltn")
-for port, what in [(25461, "client HTTP"), (25463, "client HTTPS"), (25500, "admin"), (8805, "ISP lookup"), (7999, "MariaDB")]:
+for port, what in [(8080, "client HTTP"), (443, "client HTTPS"), (8880, "admin"), (2053, "panel HTTPS"), (8805, "ISP lookup"), (7999, "MariaDB")]:
     (ok if re.search(r":%d\b" % port, listen) else bad)("port %d (%s) listening" % (port, what))
 
 # ---------------------------------------------------------------- versions / settings
