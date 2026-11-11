@@ -411,8 +411,10 @@ and was NOT swapped):
   (this manifested as "only the first stream shows in the m3u"). revalidate_freq=2 re-stats a file at
   most once every 2 seconds per worker (negligible) and lets admin changes appear within ~2s automatically.
   Changes to PHP files are picked up within about 2 seconds; to apply one instantly run
-  `pkill -USR2 -f "php-fpm: master"` as root (graceful reload). This setting does NOT affect the playlist
-  cache (setup_cache.php runs every minute from cron; run it manually to publish new streams instantly).
+  `pkill -USR2 -f "php-fpm: master"` as root (graceful reload). It also shortens the playlist delay:
+  setup_cache.php (cron, every minute) writes the cache as PHP files that are include()d, so with 60s a
+  rebuilt cache could wait up to another 60s; now new streams reach apps within about 1 minute.
+  Run setup_cache.php manually to publish new streams instantly.
 - php.ini realpath cache: `realpath_cache_size=4096k`, `realpath_cache_ttl=600` (were commented/16k);
   the panel resolves the same long paths every request, so caching cuts syscalls.
 - my.cnf `innodb_log_file_size=512M` (red did not set it): larger redo log batches more writes before a
