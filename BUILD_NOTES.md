@@ -475,3 +475,91 @@ install (`server_name _;` on the stream and panel blocks). Existing installs are
 - **Cloudflare SSL mode:** Full works with the placeholder; Full (strict) needs the real Origin certificate (526 otherwise).
 - **origin-pull-ca.pem** is unused (no `ssl_client_certificate` / `ssl_verify_client`).
 - `smoke_test.py` expects ports 8080, 443, 8880, 2053, 8805, 7999.
+- **Cloudflare real IP:** `set_real_ip_from` for the Cloudflare ranges plus `real_ip_header CF-Connecting-IP;`, so logs,
+  limits and the ISP lookup see the client IP, not Cloudflare's.
+- **Server names:** `server_name _;` on the stream and panel blocks. The blocks are told apart by port, not by name.
+- **Differs from REDSS on purpose:** BASE `nginx.conf` no longer matches REDSS (ports, TLS, real IP, blacklist, ISP lock).
+- **Existing panels:** the ISP 8805 lock is not applied automatically. Add `allow 127.0.0.1; deny all;` inside the
+  `location ~ \.php$` block of the 8805 server, then reload nginx.
+- Certificates are per domain and are never shipped in the zip.
+
+## 10. Recent adoptions and improvements (2026-11-12)
+
+### 10.1 Duplicate prevention
+Root cause: the `streams` table has no unique key, and the M3U import pages inserted without checking.
+- `admin/vod_import.php` and `admin/episode_import.php`: before the INSERT they load the existing `stream_source`
+  values for type 2 (movies) / type 5 (episodes), `json_decode` each, and skip the entry if the M3U URL, or its
+  space-to-`%20` form, already exists. This is the same method REDSS `movie.php` uses. The URL is appended to the list
+  after each insert, so one batch cannot insert the same entry twice. Empty URLs are skipped. The INSERT statements
+  are otherwise unchanged.
+- `crons/watch_folder.php`: after TMDB resolves the title, a movie (type 2) is skipped if a stream with the same
+  `stream_display_name` exists. An episode (type 5) is skipped if `series_episodes` already has the same
+  `series_id` + `season_num` + `sort` (episode number). If season/episode are unknown, it falls back to the display name
+  within the same series only. Skips are written to `watch_output` with status 1 and the existing stream id.
+  The file-path check at the top is unchanged.
+- This does NOT remove existing duplicates. Cleanup is a manual SQL step (keep `MAX(id)` per name) after a DB backup.
+- `admin/episode.php` (adopted from REDSS, matching `movie.php` / `stream.php`): the column list is wrapped in
+  `ESC()`; `enable_transcode` is reset to 0 when the transcode profile is cleared; `probesize_ondemand` defaults to 256000.
+
+### 10.2 isp/api.php rewrite
+Rewritten as readable PHP with the same output contract as before.
+- Strict IP validation; one cache file per IP at `isp/data/<md5(ip)>`, seeded with 10,340 entries from `apibackup.txt`
+  (11 invalid-JSON lines and 5 duplicate IPs skipped).
+- JSON is built with `json_encode`; upstream timeout is about 3 s; exact IP match (no substring false match);
+  cache writes are atomic; it degrades gracefully if `data/` is not writable.
+- Removed the unused `api2.php` .. `api5.php` and `api.php(option two)`. `apibackup.txt` stays in place and is not read.
+
+### 10.3 install.py
+- `streaming_servers` defaults: http 8080, https 443, rtmp 25462.
+- UFW option 2 opens 22, 80, 443, 8080, 8880, 2053, 25462, 31210 (plus 7999 on MAIN). It no longer opens
+  25461, 25463, 25500 or 8805.
+- No duplicate admin block (guarded on `listen 8880;`).
+- Placeholder `cloud_ssl_cer.cer` / `cloud_ssl_key.key` in `nginx/conf/` are created only if BOTH are missing (never
+  overwritten; warns if only one exists). A reminder to replace them with the Cloudflare Origin certificate, then run
+  `start_services.sh`, is printed and saved. Cloudflare SSL mode Full works with the placeholder; Full (strict) needs
+  the real certificate. `origin-pull-ca.pem` is not used.
+- The printed admin URL is `http://IP:8880` (https on 2053).
+
+### 10.4 admin/settings.php speed and Ads/Infos tab
+The page was slow because the hidden "Ads and Infos" tab embedded about 3.5 MB of base64 images, and nginx has gzip off.
+All Odin ads, links and images were removed from that tab and replaced by one "Contact on Telegram" button
+(`https://t.me/prabhjd`, opens in a new tab). File size 3.67 MB to 159 KB. Settings fields, the save handler and the
+other tabs are byte-identical.
+
+### 10.5 Decisions recorded (not adopted, on purpose)
+- `server_info.url` keeps using the request host (better for several domains / CDN) instead of REDSS's `domain_name`.
+- No new DB index on `streams(stream_display_name)`, to avoid touching the live DB.
+- PHP `memory_limit` stays 2048M.
+- REDSS `file_uploads=Off` and its low `max_input_vars` must not be copied: they break M3U upload, DB restore and big forms.
+- The `lbznuff/` LB payload and `sub_FINAL.zip` are out of scope for now.
+
+### 10.6 Release and distribution
+- `main_FINAL.zip` is a GitHub release asset; the installer downloads `releases/latest/download/main_FINAL.zip`.
+  `install.py` is fetched from raw `main`.
+- Zip entries are stored as `iptv_xtream_codes/<path>`. The zip is rebuilt by copying entries from the previous zip and
+  replacing only the changed files (Python `zipfile`, `ZIP_DEFLATED`, `allowZip64`), then checking markers and `testzip()`.
+- Panel PHP files are NOT committed to the repo. Only the zip asset carries them.
+
+### 10.7 Operations notes
+- `rclone-vfs-mount-refresh.timer` moved from every 3 hours to a daily `OnCalendar` at 05:00 UTC, to save Google Drive
+  API requests (the mount already has `dir-cache-time 8760h` and `poll-interval 15s`). If the `vod_heal` daily cron
+  exists, run it after the refresh (for example 06:30).
+- A watch folder with "probe input files" off does not read media from Google Drive.
+- Check for Google throttling:
+  ```sh
+  zgrep -hiE "googleapi|ratelimitexceeded|quotaexceeded|error 403" /var/log/syslog*
+  ```
+  rclone at `-v` hides retried errors, so the Cloud Console Drive API metrics are the authoritative source.
+
+### 10.8 vod_heal.py
+Lives on the `vod-heal` branch (see its README). Current version N reads DB settings from the panel's own config and
+loads panel ids/years automatically. On `--apply` it updates `target_container` and `stream_source` in the DB. `--review`
+gives interactive decisions, `--cleanup` is available, and the dry run lists every link it would repair.
+
+### 10.9 Post-install checks
+- nginx is running.
+- `http://IP:8880` opens the login page.
+- A stream plays on port 8080.
+- The certificate reminder was shown; replace the placeholder certificates with the real ones.
+- Import the same M3U twice: the second import adds nothing.
+- Provider/country show on the connections page (`isp/api.php` works).
