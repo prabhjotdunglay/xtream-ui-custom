@@ -52,7 +52,7 @@ import sys
 import time
 import unicodedata
 
-VERSION = "2026-11-08-N (auto DB connect, integrated cleanup, update-source SQL, mirror-from B, no-drive orphan removal, drive speed check, folder-delay, ctrl-c, progress heartbeat, fast cleanup lookups, include-working, undo-orphans, panel-ids/orphans, cleanup export, remove-links, trial, find-gone, peek, auto-pick, panel-info, decisions)"
+VERSION = "2026-11-12-O (fix panel years: releasedate + series year, auto DB connect, integrated cleanup, update-source SQL, mirror-from B, no-drive orphan removal, drive speed check, folder-delay, ctrl-c, progress heartbeat, fast cleanup lookups, include-working, undo-orphans, panel-ids/orphans, cleanup export, remove-links, trial, find-gone, peek, auto-pick, panel-info, decisions)"
 
 # ---------------------------------------------------------------------------
 # Panel config reader + DB helper
@@ -104,22 +104,40 @@ def db_fetch_ids(conn):
 
 
 def db_fetch_years(conn):
-    """Return dict {stream_id_str: year_int} from streams.movie_propeties JSON for movies/episodes."""
+    """Return dict {stream_id_str: year_int}, the same data the old manual panel_years.tsv export held:
+    movies (type 2): year of movie_propeties.releasedate (the panel writes this key in lower case);
+    episodes (type 5): the SERIES year (series.releaseDate), because show folders are named
+    "Show (Year)" after the series, not after the episode air date."""
+    def year_of(v):
+        m = re.match(r"^(\d{4})", str(v or "").strip().strip('"'))
+        return int(m.group(1)) if m and 1880 <= int(m.group(1)) <= 2100 else None
+
     years = {}
     with conn.cursor() as c:
         c.execute(
             "SELECT `id`, `movie_propeties` FROM `streams` "
-            "WHERE `type` IN (2, 5) AND `movie_propeties` IS NOT NULL AND `movie_propeties` != ''"
+            "WHERE `type` = 2 AND `movie_propeties` LIKE '{%'"
         )
         for row in c.fetchall():
             try:
                 props = json.loads(row[1]) if row[1] else {}
-                rd = str(props.get("releaseDate") or props.get("release_date") or "").strip().strip('"')
-                m = re.match(r"^(\d{4})", rd)
-                if m and 1880 <= int(m.group(1)) <= 2100:
-                    years[str(row[0])] = int(m.group(1))
             except Exception:
-                pass
+                continue
+            if not isinstance(props, dict):
+                continue
+            # case-insensitive key lookup: releasedate / releaseDate / release_date
+            low = {str(k).lower(): v for k, v in props.items()}
+            y = year_of(low.get("releasedate") or low.get("release_date"))
+            if y:
+                years[str(row[0])] = y
+        c.execute(
+            "SELECT e.`stream_id`, r.`releaseDate` FROM `series_episodes` e "
+            "JOIN `series` r ON r.`id` = e.`series_id`"
+        )
+        for sid, rd in c.fetchall():
+            y = year_of(rd)
+            if y:
+                years[str(sid)] = y
     return years
 
 
