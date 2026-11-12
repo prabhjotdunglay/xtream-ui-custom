@@ -35,9 +35,20 @@ SAFETY
 
 USAGE
   python3 vod_heal.py                       # dry run, report only
-  python3 vod_heal.py --apply               # repair what can be repaired safely
+  python3 vod_heal.py --apply               # repair what can be repaired safely AND fix the panel file type
+                                            # (target_container) so it matches the link that really exists
   python3 vod_heal.py --undo /path/to/heal_YYYYmmdd_HHMMSS.tsv
   python3 vod_heal.py --help
+
+WHAT TO DO NEXT
+  1. Dry run (above): shows the repairs and a "FILE TYPE IN PANEL" section. Nothing is changed.
+  2. --apply: does the repairs and the file-type labels in one run (undo files are written).
+  3. Customers refresh their playlist in the app. The playlist updates within about a minute
+     (setup_cache.php cron); run setup_cache.php on the main server to publish immediately.
+  The file-type step is part of the normal run (needs the panel DB). --no-fix-containers skips it.
+  It runs in the normal run only (also with --cleanup, which it precedes); not in --mirror-from,
+  --remove-orphans, --remove-links, --review, --undo, --peek, --find-gone. --trial / --only-ids /
+  --skip-ids limit it to the same ids. --fix-containers still works on its own (whole library).
 """
 import argparse
 import collections
@@ -52,7 +63,7 @@ import sys
 import time
 import unicodedata
 
-VERSION = "2026-11-12-P (fix-containers, fix panel years: releasedate + series year, auto DB connect, integrated cleanup, update-source SQL, mirror-from B, no-drive orphan removal, drive speed check, folder-delay, ctrl-c, progress heartbeat, fast cleanup lookups, include-working, undo-orphans, panel-ids/orphans, cleanup export, remove-links, trial, find-gone, peek, auto-pick, panel-info, decisions)"
+VERSION = "2026-11-12-Q (normal run also fixes panel file type, fix-containers, fix panel years: releasedate + series year, auto DB connect, integrated cleanup, update-source SQL, mirror-from B, no-drive orphan removal, drive speed check, folder-delay, ctrl-c, progress heartbeat, fast cleanup lookups, include-working, undo-orphans, panel-ids/orphans, cleanup export, remove-links, trial, find-gone, peek, auto-pick, panel-info, decisions)"
 
 # ---------------------------------------------------------------------------
 # Panel config reader + DB helper
@@ -1725,11 +1736,12 @@ def _panel_ext(raw):
     except (ValueError, TypeError):
         pass
     return ""
-def fc_scan(conn, movies_dir):
+def fc_scan(conn, movies_dir, restrict=None, exclude=None):
     """Compare each movie/episode's panel file type with the links in movies/.
     Returns [(id, type, title, old_raw, new_ext_or_None, status)], status one of
     OK, FIXABLE, AMBIGUOUS, NO_WORKING, NO_LINK. Only a directory listing is used for the 'OK' decision;
-    the drive is touched only for ids whose panel type has no link."""
+    the drive is touched only for ids whose panel type has no link.
+    restrict: only these ids (set of str); exclude: never these ids."""
     idx = index_links(movies_dir)
     with conn.cursor() as cur:
         cur.execute("SELECT id, type, stream_display_name, target_container FROM streams WHERE type IN (2,5)")
@@ -1737,6 +1749,8 @@ def fc_scan(conn, movies_dir):
     out = []
     for sid, typ, title, old in db_rows:
         sid = str(sid)
+        if (restrict is not None and sid not in restrict) or (exclude and sid in exclude):
+            continue
         if isinstance(old, bytes):
             old = old.decode("utf-8", "replace")
         links = idx.get(sid, [])
@@ -1759,6 +1773,121 @@ def fc_scan(conn, movies_dir):
         else:
             out.append((sid, typ, title, old, None, "NO_WORKING"))
     return out
+def _fc_clean(s):
+    return str(s if s is not None else "").replace("\t", " ").replace("\r", " ").replace("\n", " ")
+
+
+def fc_write_tsv(res, log_dir, stamp):
+    tsv = os.path.join(log_dir, "containers_%s.tsv" % stamp)
+    with open(tsv, "w", encoding="utf-8") as fh:
+        fh.write("id\ttype\ttitle\told\tnew\tstatus\n")
+        for sid, typ, title, old, new, st in res:
+            fh.write("%s\t%s\t%s\t%s\t%s\t%s\n" % (
+                sid, typ, _fc_clean(title), "NULL" if old is None else _fc_clean(old),
+                json.dumps([new]) if st == "FIXABLE" else (new or ""), st))
+    return tsv
+
+
+def fc_apply(conn, fix, log_dir, stamp):
+    """Write the undo SQL, then update target_container for the FIXABLE rows. Returns (rows_changed, undo_path).
+    On a database error: rolls back and re-raises."""
+    undo = os.path.join(log_dir, "containers_undo_%s.sql" % stamp)
+    with open(undo, "w", encoding="utf-8") as fh:
+        fh.write("-- Run on the MAIN panel DB:  mysql -u root xtream_iptvpro < %s\n" % os.path.basename(undo))
+        for sid, typ, title, old, new, st in fix:
+            val = "NULL" if old is None else "'%s'" % sql_lit(old)
+            fh.write("UPDATE `streams` SET `target_container` = %s WHERE `id` = %d AND `type` IN (2,5);\n"
+                     % (val, int(sid)))
+    bynew = collections.defaultdict(list)
+    for r in fix:
+        bynew[r[4]].append(int(r[0]))
+    changed = 0
+    try:
+        with conn.cursor() as cur:
+            for ext, ids in bynew.items():
+                val = json.dumps([ext])
+                for i in range(0, len(ids), 500):
+                    chunk = ids[i:i + 500]
+                    cur.execute("UPDATE streams SET target_container = %%s WHERE id IN (%s) AND type IN (2,5)"
+                                % ",".join(["%s"] * len(chunk)), [val] + chunk)
+                    changed += cur.rowcount
+        conn.commit()
+    except Exception:
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        raise
+    return changed, undo
+
+
+def fc_total(conn):
+    with conn.cursor() as cur:
+        cur.execute("SELECT COUNT(*) FROM streams WHERE type IN (2,5)")
+        return int(cur.fetchone()[0])
+
+
+def fc_normal_run(a, conn, stamp, restrict, exclude):
+    """The file-type step of the normal run. Same scan/apply/guard as --fix-containers, limited to
+    restrict/exclude ids. Never raises. Returns a dict for fc_print_section."""
+    r = {"fix": [], "amb": [], "nowork": [], "changed": 0, "undo": "", "tsv": "", "refused": False,
+         "pct": 0.0, "total": 0, "error": ""}
+    try:
+        res = fc_scan(conn, a.movies_dir, restrict, exclude)
+        by = collections.defaultdict(list)
+        for x in res:
+            by[x[5]].append(x)
+        r["fix"], r["amb"], r["nowork"] = by["FIXABLE"], by["AMBIGUOUS"], by["NO_WORKING"]
+        r["total"] = fc_total(conn)
+        r["pct"] = (100.0 * len(r["fix"]) / r["total"]) if r["total"] else 0.0
+        if a.apply and r["fix"]:
+            if r["pct"] > 30.0 and not a.force:
+                r["refused"] = True
+            else:
+                r["tsv"] = fc_write_tsv(res, a.log_dir, stamp)
+                r["changed"], r["undo"] = fc_apply(conn, r["fix"], a.log_dir, stamp)
+    except Exception as e:
+        r["error"] = str(e)
+    return r
+
+
+def fc_print_section(a, r, D):
+    """Prints the FILE TYPE IN PANEL section (nothing if there is nothing to say)."""
+    fix = r["fix"]
+    if not (fix or r["amb"] or r["nowork"] or r["refused"] or r["error"]):
+        return
+    print("")
+    print(D)
+    print("  FILE TYPE IN PANEL")
+    print("")
+    if r["error"]:
+        print("  ! Could not check/fix the panel file types: %s" % r["error"])
+        print("    Nothing was changed for file types.")
+        return
+    print("  FIXABLE          %d  (panel shows a file type that does not exist; the working one is used)" % len(fix))
+    br = collections.Counter((_panel_ext(x[3]) or "(none)", x[4]) for x in fix)
+    for (o, n), c in sorted(br.items(), key=lambda kv: -kv[1]):
+        print("      %s -> %s: %s" % (o, n, format(c, ",")))
+    print("  AMBIGUOUS        %d  (several working files, not changed)" % len(r["amb"]))
+    print("  NO WORKING FILE  %d  (broken, see the repair list above)" % len(r["nowork"]))
+    if fix:
+        print("")
+        for sid, typ, title, old, new, st in fix[:5]:
+            print("  %-8s  %-40s  %s -> %s" % (sid, _fc_clean(title)[:40], _panel_ext(old) or "(none)", new))
+    print("")
+    if r["refused"]:
+        print("  ! WARNING: file types NOT changed: %.0f%% of all titles (%d of %d) would change. That is far more"
+              % (r["pct"], len(fix), r["total"]))
+        print("    than expected and may mean the drive or the database looks wrong. The repairs above were")
+        print("    done as normal. If you checked and it is right, run again with --force.")
+    elif a.apply and fix:
+        print("  ✓ File type (target_container) updated in panel DB: %d rows" % r["changed"])
+        print("    Log: %s" % r["tsv"])
+        print("    Undo, on the main DB server:  mysql -u root xtream_iptvpro < %s" % r["undo"])
+    elif fix:
+        print("  add --apply to fix these too")
+
+
 def cmd_fix_containers(a, conn, db_warn):
     """Sets the panel's file type (streams.target_container) to the type of the link that really exists in movies/."""
     if conn is None:
@@ -1790,14 +1919,8 @@ def cmd_fix_containers(a, conn, db_warn):
         by[r[5]].append(r)
     total = len(res)
     fix = by["FIXABLE"]
-    clean = lambda s: str(s if s is not None else "").replace("\t", " ").replace("\r", " ").replace("\n", " ")
-    tsv = os.path.join(a.log_dir, "containers_%s.tsv" % stamp)
-    with open(tsv, "w", encoding="utf-8") as fh:
-        fh.write("id\ttype\ttitle\told\tnew\tstatus\n")
-        for sid, typ, title, old, new, st in res:
-            fh.write("%s\t%s\t%s\t%s\t%s\t%s\n" % (
-                sid, typ, clean(title), "NULL" if old is None else clean(old),
-                json.dumps([new]) if st == "FIXABLE" else (new or ""), st))
+    clean = _fc_clean
+    tsv = fc_write_tsv(res, a.log_dir, stamp)
     pct = (100.0 * len(fix) / total) if total else 0.0
     W = 70
     D = "-" * W
@@ -1840,31 +1963,9 @@ def cmd_fix_containers(a, conn, db_warn):
             print("  may mean the drive or the database looks wrong. Nothing was changed.")
             print("  If you checked and it is right, add --force.")
         else:
-            undo = os.path.join(a.log_dir, "containers_undo_%s.sql" % stamp)
-            with open(undo, "w", encoding="utf-8") as fh:
-                fh.write("-- Run on the MAIN panel DB:  mysql -u root xtream_iptvpro < %s\n" % os.path.basename(undo))
-                for sid, typ, title, old, new, st in fix:
-                    val = "NULL" if old is None else "'%s'" % sql_lit(old)
-                    fh.write("UPDATE `streams` SET `target_container` = %s WHERE `id` = %d AND `type` IN (2,5);\n"
-                             % (val, int(sid)))
-            bynew = collections.defaultdict(list)
-            for r in fix:
-                bynew[r[4]].append(int(r[0]))
             try:
-                with conn.cursor() as cur:
-                    for ext, ids in bynew.items():
-                        val = json.dumps([ext])
-                        for i in range(0, len(ids), 500):
-                            chunk = ids[i:i + 500]
-                            cur.execute("UPDATE streams SET target_container = %%s WHERE id IN (%s) AND type IN (2,5)"
-                                        % ",".join(["%s"] * len(chunk)), [val] + chunk)
-                            changed += cur.rowcount
-                conn.commit()
+                changed, undo = fc_apply(conn, fix, a.log_dir, stamp)
             except Exception as e:
-                try:
-                    conn.rollback()
-                except Exception:
-                    pass
                 print("")
                 print("  The database update failed and was rolled back: %s" % e)
                 return 1
@@ -1890,12 +1991,6 @@ def cmd_fix_containers(a, conn, db_warn):
     if by["NO_WORKING"]:
         print("  Titles with no working file: run the normal repair (without --fix-containers).")
     return 0 if not refused else 2
-def wrong_type_count(conn, movies_dir):
-    """How many titles --fix-containers would fix (for the hint line). Never raises."""
-    try:
-        return sum(1 for r in fc_scan(conn, movies_dir) if r[5] == "FIXABLE")
-    except Exception:
-        return 0
 def run():
     try:
         return main()
@@ -1919,6 +2014,13 @@ def main():
     ap.add_argument("--fix-containers", action="store_true",
                     help="fix the panel file type (target_container) of movies/episodes so it matches the link that "
                          "really exists in movies/ (dry run unless --apply; run on the LB)")
+    ap.add_argument("--no-fix-containers", action="store_true",
+                    help="skip the file-type step of the normal run. Normally the dry run shows a FILE TYPE IN PANEL "
+                         "section and --apply also fixes the panel file type (target_container) to match the link "
+                         "that really exists. It needs the panel DB, runs only in the normal run (before --cleanup), "
+                         "not in --mirror-from / --remove-orphans / --review / --peek etc., and is limited to the "
+                         "same ids as --trial (only the trial ids) / --only-ids / --skip-ids. Same 30%% guard as "
+                         "--fix-containers (--force overrides); if it trips only this step is skipped")
     ap.add_argument("--peek", action="store_true",
                     help="READ-ONLY: show a few real examples of the groups that need a human look")
     ap.add_argument("--search-root", default="/mnt/unionfs", help="where --find-gone looks (default /mnt/unionfs)")
@@ -2474,6 +2576,33 @@ def main():
                           "not resolve. UNDO NOW:  python3 %s --undo %s"
                           % (changed, vanished, not_resolving, os.path.abspath(sys.argv[0]), tsv))
 
+    # ---- file type in the panel (same logic as --fix-containers), on the links AFTER the repair ----
+    fc = None
+    fc_note = ""
+    if not a.no_fix_containers and not a.mirror_from:
+        if _db_conn is None:
+            if _db_warn:
+                fc_note = "NOTE: %s — panel file types not checked" % _db_warn
+        else:
+            if a.trial:
+                fc_restrict = set(t[1] for t in trial_info)
+            elif only:
+                fc_restrict = set(only)
+            else:
+                fc_restrict = None
+            fc_exclude = set(skip)
+            if a.apply:
+                if not sqlfile:      # the repair already set target_container for these ids in the DB
+                    for idl in ext_ids.values():
+                        fc_exclude.update(idl)
+            else:                    # dry run: links not repointed yet; these ids are handled by the repair
+                for r in rows:
+                    if r[0] == "WOULD_FIX":
+                        m_ = re.match(r"^(\d+)\.", os.path.basename(r[1]))
+                        if m_:
+                            fc_exclude.add(m_.group(1))
+            fc = fc_normal_run(a, _db_conn, stamp, fc_restrict, fc_exclude)
+
     W = 70
     D = "-" * W
     me = os.path.abspath(sys.argv[0])
@@ -2620,23 +2749,32 @@ def main():
     print(D)
     print("  WHAT TO DO NEXT")
     print("")
-    if not a.apply and fixed > 0:
-        print("  1. Fix the %d repairable links:" % fixed)
+    fc_fix_n = len(fc["fix"]) if fc and not fc["error"] else 0
+    todo_apply = not a.apply and (fixed > 0 or fc_fix_n > 0)
+    if todo_apply:
+        what = []
+        if fixed > 0:
+            what.append("%d repairable links" % fixed)
+        if fc_fix_n > 0:
+            what.append("%d panel file types" % fc_fix_n)
+        print("  1. Fix the %s:" % " and ".join(what))
         print("     sudo -u xtreamcodes python3 %s --apply" % me)
     if attn:
-        step = 2 if (not a.apply and fixed > 0) else 1
+        step = 2 if todo_apply else 1
         print("  %d. Work through the %d items that need a decision:" % (step, len(attn)))
         print("     sudo -u xtreamcodes python3 %s --review" % me)
     if a.apply and fixed > 0 and not a.cleanup:
         print("  When ready, clean up dead titles from the panel:")
         print("     sudo -u xtreamcodes python3 %s --apply --cleanup" % me)
 
-    if _db_conn is not None:
-        wrong_n = wrong_type_count(_db_conn, a.movies_dir)
-        if wrong_n > 0:
-            print("")
-            print("  %d titles have the wrong file type in the panel (apps cannot play them) - fix with: "
-                  "sudo -u xtreamcodes python3 %s --fix-containers" % (wrong_n, me))
+    if a.apply and (fixed > 0 or (fc and fc["changed"])):
+        print("  Customers must refresh their playlist in the app. Playlists update within about a minute")
+        print("  (setup_cache.php cron); run setup_cache.php on the main server to publish immediately.")
+    if fc_note:
+        print("")
+        print("  " + fc_note)
+    if fc:
+        fc_print_section(a, fc, D)
     print("Took %.0fs." % (time.time() - t0))
     if not a.apply and len(attn) > 0:
         print("")
