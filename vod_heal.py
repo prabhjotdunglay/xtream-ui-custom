@@ -63,7 +63,7 @@ import sys
 import time
 import unicodedata
 
-VERSION = "2026-11-12-Q (normal run also fixes panel file type, fix-containers, fix panel years: releasedate + series year, auto DB connect, integrated cleanup, update-source SQL, mirror-from B, no-drive orphan removal, drive speed check, folder-delay, ctrl-c, progress heartbeat, fast cleanup lookups, include-working, undo-orphans, panel-ids/orphans, cleanup export, remove-links, trial, find-gone, peek, auto-pick, panel-info, decisions)"
+VERSION = "2026-11-12-R (apt pymysql hint, normal run also fixes panel file type, fix-containers, fix panel years: releasedate + series year, auto DB connect, integrated cleanup, update-source SQL, mirror-from B, no-drive orphan removal, drive speed check, folder-delay, ctrl-c, progress heartbeat, fast cleanup lookups, include-working, undo-orphans, panel-ids/orphans, cleanup export, remove-links, trial, find-gone, peek, auto-pick, panel-info, decisions)"
 
 # ---------------------------------------------------------------------------
 # Panel config reader + DB helper
@@ -89,7 +89,7 @@ def db_connect(cfg=None, config_path=CONFIG_FILE):
     try:
         import pymysql
     except ImportError:
-        return None, "pymysql not installed (run: pip3 install pymysql)"
+        return None, "pymysql not installed (run as root: apt install -y python3-pymysql)"
     if cfg is None:
         try:
             cfg = read_panel_config(config_path)
