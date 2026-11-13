@@ -557,10 +557,16 @@ other tabs are byte-identical.
   rclone at `-v` hides retried errors, so the Cloud Console Drive API metrics are the authoritative source.
 
 ### 10.8 vod_heal.py
-Lives on the `vod-heal` branch (see its README). Current version N reads DB settings from the panel's own config and
+Lives on the `vod-heal` branch (see its README). Current version is R (2026-11-12-R). It reads DB settings from the panel's own config and
 loads panel ids/years automatically. On `--apply` it updates `target_container` and `stream_source` in the DB. `--review`
 gives interactive decisions, `--cleanup` is available, and the dry run lists every link it would repair.
-
+Versions O to R added:
+- Panel years: movies use the year of `movie_propeties` `releasedate`; episodes use the series year (`series.releaseDate`),
+  because show folders are named by the series year.
+- Panel file type (`target_container`) is now fixed by the normal dry run / `--apply`. The dry run shows a
+  "FILE TYPE IN PANEL" section. `--no-fix-containers` skips this step; `--fix-containers` still works on its own
+  (whole library).
+- pymysql on Ubuntu 24.04: `apt install -y python3-pymysql` (as root). The script prints this hint when pymysql is missing.
 ### 10.9 Post-install checks
 - nginx is running.
 - `http://IP:8880` opens the login page.
@@ -568,3 +574,65 @@ gives interactive decisions, `--cleanup` is available, and the dry run lists eve
 - The certificate reminder was shown; replace the placeholder certificates with the real ones.
 - Import the same M3U twice: the second import adds nothing.
 - Provider/country show on the connections page (`isp/api.php` works).
+
+## 11. EPG auto-assign (links EPG to live channels from the existing providers)
+User guide: [EPG_AUTO_ASSIGN.md](EPG_AUTO_ASSIGN.md).
+
+### 11.1 What it does
+- Card **Auto-assign EPG** on Management, Service Setups, EPGs. Default Off.
+- Links only channels with no working EPG link, and only when the cleaned channel name matches exactly one provider channel
+  (country hints respected, provider priority list decides ties). Anything unsure is listed for review, never guessed.
+- Works with any number of providers; adding or deleting providers needs no change. Channels linked to a deleted provider are
+  re-assigned (Auto-assign On). Dead links (channel gone from a live provider) wait for 3 consecutive cron runs by default.
+- Manual fix in the channel editor, EPG tab: Quick Search across all providers, Suggested, Clear EPG. Streams list and mass
+  edit have a **No EPG** filter and Clear EPG. Preview, Assign now, CSV report, Review ambiguous, Undo
+  (`php tools/epg_assign.php --undo=logs/epg_auto/changes_<time>.tsv`).
+- Excluded categories (cameras, CCTV, private) are never touched; a warning counts linked channels in them.
+
+### 11.2 Change set vs the pre-EPG build
+- New: `admin/epg_auto.php`, `admin/epg_auto_api.php`, `admin/assets/js/epg_auto.js`, `tools/epg_assign.php`.
+- Changed: `admin/api.php`, `admin/epgs.php`, `admin/functions.php`, `admin/stream.php`, `admin/stream_mass.php`,
+  `admin/streams.php`, `admin/table_search.php`, `crons/epg.php`, `database.sql` (`epg_data` block only).
+- `crons/watch_folder.php`: line endings restored to CRLF (differs from the pre-EPG build by CR bytes only).
+- Not touched: `wwwdir/`, `lbznuff/`, `php.ini`, nginx configs, `install.py`, other crons.
+
+### 11.3 Zero impact when the feature is Off
+- Admin pages run the same queries as before (statement counts compared old vs new for every touched page).
+- The cron stores the same guide as before for channels with a correct language, apart from the intended differences below.
+- Streaming and the apps are not involved.
+
+### 11.4 Intended behaviour differences
+- The EPG update writes only the difference (window replace) instead of re-inserting everything and de-duplicating. Corrected,
+  moved or removed programmes follow the provider; a down or empty provider leaves stored programmes alone.
+- **Force EPG Reload** no longer truncates the programme table; it runs the same update.
+- Title fallback: if `epg_lang` is not found in a programme, the first title is used instead of an empty one.
+- `epg_lang` of `''` or `'NULL'` is treated as no language.
+- `admin/stream.php` stores NULL (not the text "NULL") for an empty `epg_lang`.
+- `epg_data` gets index `epg_chan_start (epg_id, channel_id, start)` and `id` BIGINT, migrated once by `crons/epg.php`
+  (log: `logs/epg_migrate.log`). Exact SQL and dump/restore results are in [EPG_AUTO_ASSIGN.md](EPG_AUTO_ASSIGN.md#upgrade-and-migration).
+- With Auto-assign On: cleared channels stay cleared (opt-out list), unused providers' programmes are pruned (max 200,000 rows
+  per update), stricter country-aware matching, optional preferred EPG language. The fingerprint format changed once, so
+  there is one extra cron run after the upgrade.
+
+### 11.5 Measured numbers (MySQL 8.0 / MariaDB, test machine)
+- Daily cron 33% to 62% faster, 7x to 14x fewer rows written; a repeated run with the same feed writes nothing and does not
+  consume ids. Only the very first load into an empty table is 0% to 4% slower.
+- Programme lookup by channel and time about 2x faster with the new index.
+- Bulk assign of 12k streams against 5 providers: about 3 s and 156 MB.
+- Migration on about 80,000 rows: about 1 s. Cron peak memory 1.3 to 1.5 GB at 15,000 channels / 571k programmes.
+
+### 11.6 Not implemented, and why
+- `xmltv.php` static cache (D4): the file is obfuscated and was not touched. The write side is now small; the read side is unchanged.
+- Cron schedule change (D6): kept at `0 1 * * *`. A new run kills the previous one, so keep the interval well above the run time.
+
+### 11.7 Not verified
+- PHP 7.4 at runtime (tested on PHP 8.2 plus a 7.4 syntax check).
+- MariaDB 10.x (tested on a newer MariaDB and MySQL 8.0; the statements used are standard for 10.x).
+- The obfuscated `wwwdir` readers (xmltv, player_api): covered by queries of the same shape.
+- A real browser (tested with jsdom only).
+
+### 11.8 Post-install checks for EPG
+- The 01:00 EPG update finishes (check `logs/epg_migrate.log` after the first run and time one run on your server).
+- The guide shows in an app for a linked channel.
+- Exclude camera / CCTV / private categories before the first run.
+- Press **Preview** before **Assign now**.
