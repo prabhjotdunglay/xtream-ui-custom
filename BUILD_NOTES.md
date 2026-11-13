@@ -636,3 +636,41 @@ User guide: [EPG_AUTO_ASSIGN.md](EPG_AUTO_ASSIGN.md).
 - The guide shows in an app for a linked channel.
 - Exclude camera / CCTV / private categories before the first run.
 - Press **Preview** before **Assign now**.
+### 11.9 EPG auto-assign: accuracy round
+Matching quality was reworked after a test on a real list of 12,651 live channels and two large providers. Docs: [EPG_AUTO_ASSIGN.md](EPG_AUTO_ASSIGN.md#accuracy-update).
+
+**Root causes found**
+- Provider tags were never cleaned: names ending in " US", ids ending in `.us2`, `.ca2`, `.us_locals1`. The two sides never produced the same key.
+- US local stations (about 1,800 channels) can only be linked by call sign, and the engine had no call-sign logic.
+- Country hints were read wrongly: US state codes were read as countries (`CA |` Canada, `IN |` India, `AL |` Albania), `USA`, `US`, `PT`, `BR`, `LA`, `CARIB` were not read, and the category hint was empty for categories like CABLE, NEWS, LOCAL - NBC, ALL LATIN. With no country, the cross-country rule made most matches ambiguous, or picked a wrong-country copy.
+- About 47% of the list can never have a normal guide (24/7 loops, event and game slots, PPV, adult, cameras, blank names) and was mixed into the numbers.
+
+**What changed**
+- Provider tag cleanup, call-sign matching (US and CA), league/team and alias tiers, feed variants (East/West), country prefixes, state codes read as states, home country (default `us`).
+- Not EPG-able classifier (loop, event, PPV, adult, cam, empty). Never linked, shown as its own number.
+- Every unsure channel gets a reason, in the Review list and in the CSV (`reason`, `reason_text`). Card shows Assigned / Needs review / No match in your providers / Not EPG-able. Found-vs-written diagnostic when matches were found but not written.
+- New settings (same `epg_auto_` prefix and settings table, no schema change): `tag_map`, `cat_map`, `home_cc`, `carib_us`, `noepg_cats`, `noepg_off`, `noepg_suggest`, `last_reasons`.
+- One-click category accept is built and tested but dormant (the allowed-reason list is empty until reasons are measured as safe).
+
+**Files changed this round**
+- `admin/epg_auto.php`, `admin/epg_auto_api.php`, `admin/assets/js/epg_auto.js`, `tools/epg_assign.php`
+- New: `admin/epg_auto_data.php` (data only: tag map, networks, aliases, event words; loaded only when a run starts)
+- `crons/epg.php` and all other files are unchanged. No schema change. `epg.data` is unchanged.
+
+**Measured before / after** (12,651 channels, two real providers)
+- Assigned 378 -> 3,023. Needs review 335 -> 752. Not EPG-able 5,917.
+- Precision 78.9% -> 99.3% on a 342-row labelled set. The rules were tuned on this set, so this is optimistic.
+- Coverage of matchable channels 9.7% -> 89.7%; 92.3% if the first review suggestion is accepted per row.
+- Existing-link check: 502 of 562 links the engine linked again were the same channel; 31 existing links were flagged as likely wrong.
+
+**Performance**
+- Bulk run about 1.2x the old time, about 200 MB. Cron hook with nothing changed: 9 ms, same as before. Feature Off: pages run the same statements (16/16).
+
+**Tests**
+- All suites pass. 10 failures in `itest7` are pre-existing and identical with the old engine (cron fixtures, untouched code).
+- PHP 7.4 was checked for grammar only, not run.
+
+**Limits**
+- An independent hold-out set is not labelled yet, so the precision numbers are not independent.
+- One-click category accept is dormant until reasons are measured.
+- Very large providers (for example a 1.9 GB XMLTV) are loaded fully by the existing `crons/epg.php` and need several GB of RAM. Smaller per-country files are lighter.

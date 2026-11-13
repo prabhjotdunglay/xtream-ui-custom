@@ -120,6 +120,74 @@ These changes keep the stored programmes exactly the same; they only make the up
 4. Press **Preview**, then **Assign now**. Channels the new provider does not cover stay unassigned and are picked up the next time you add a provider.
 5. For languages other than the provider's first one, type the language code under **Preferred EPG language** (for example `en`).
 
+## Accuracy update
+
+The matcher was rebuilt after a test on a real list of about 12,600 live channels and two large EPG providers. Before, only a few hundred channels were linked and about 1 in 4 of those was wrong. Now about 3,000 are linked and 139 of 140 spot-checked links were right. The spot-check set is the one the rules were tuned on, so treat that as a best case.
+
+### How matching works now
+
+- **Provider tags are cleaned.** Providers add their own tags to names and ids, such as a trailing ` US`, or `.us2` and `.us_locals1` at the end of an id. These are read as country tags and removed, so both sides can be compared.
+- **US and Canadian local stations are matched by call sign.** The call sign is the four letters starting with K or W (for example WSVN or KTAZ), or the Canadian C-call signs. Keep it in the channel name, like `FL | Miami | FOX WSVN`. If the name says CBS but the call sign belongs to an NBC station, the channel goes to Review.
+- **Country prefixes are understood:** `USA`, `US`, `CA`, `PT`, `BR`, `LA` (Latin America) and `CARIB` (Caribbean), next to the ones that already worked (`UK:`, `|UK|` and so on).
+- **US state codes are states, not countries.** `CA | Los Angeles | CBS 9 KCAL` is California, `IN | Indianapolis | NBC WTHR` is Indiana. They are no longer read as Canada or India.
+- **Names without a country use the home country.** A name that exists in several countries (CNN, Discovery, TCM) and has no country in the name or category is linked to the home country copy. The home country is `us` unless you change it. If the category is too general to say (for example Latin America), the channel goes to Review.
+
+### The numbers on the card
+
+The card says, in plain English, for example: Assigned 3,023, Needs review 752, No match in your providers 2,959, Not EPG-able 5,917.
+
+| Number | Meaning | What you do |
+|---|---|---|
+| Assigned | Confident matches only: call sign, an exact name in the right country, or league and team. Written automatically. | Nothing. Fix a single wrong one in the channel's EPG tab. |
+| Needs review | A candidate exists but the engine will not guess. Each one has a reason. | Open **Review ambiguous** and press **Assign** next to the right candidate. |
+| No match in your providers | None of your providers has this channel. | Add a provider that carries it and press **Force EPG Reload**. |
+| Not EPG-able | Channels that cannot have a normal TV guide (see below). Never linked. | Nothing. |
+
+The old technical line (Ambiguous, Unmatched, Deferred, excluded, dead links) stays below for reference.
+
+The CSV report has two extra columns, `reason` and `reason_text`, for every channel. Statuses are `ambiguous`, `unmatched` and `not_epgable`; existing links that look wrong are listed as `link_suspect` (counted and reported only, never changed). The Review list has the same reasons in plain words, with filters by category and reason.
+
+If a run found confident matches but wrote none (database errors, or channels that were no longer fillable), the card says so and why. A zero is never silent.
+
+### Not EPG-able
+
+These channels are left alone on purpose and are never linked, not even by hand from Review:
+
+- 24/7 loops (a channel that plays one show or movie set all day)
+- event and game slots (for example `NCAAF 73: NO EVENT`, `ESPN+ 155 | A vs. B`)
+- pay-per-view slots
+- adult channels
+- cameras
+- channels with a blank name
+
+If a class is wrong for you (for example a real 24/7 news channel), switch it off under Advanced matching with **Treat as normal list**.
+
+### New settings (card, Advanced matching)
+
+| Setting | What it does |
+|---|---|
+| Home country | Country used for names that have no country. Default `us`. Change it if most of your channels are from somewhere else. |
+| Country tags (`word=cc`) | Your own prefixes, one per line, for example `sp=mx`. Use `word=!` to remove a built-in tag. |
+| Category hints (`word=cc`) | A word in a category name that tells the country, for example `portugal=pt`. Special values: `latam` (Latin America), `carib` (Caribbean), `asia`, and `-` (no country, do not guess). |
+| Not EPG-able categories | Categories whose channels are all treated as Not EPG-able (for example a category of event slots). |
+| Treat as normal list | Not EPG-able classes you want treated as normal channels. |
+| Suggested categories button | After a run the card can suggest categories that look like event or 24/7 lists. One click adds them to the Not EPG-able list. |
+| Caribbean may use the US copy | Whether Caribbean channels may use the US version of a US network. |
+
+One-click accept for a whole category is built (**Preview and accept suggestions**: a list with checkboxes, a count, and a confirmation before anything is written; it can be undone with the Undo command). It is switched off for now because no review reason has been measured as safe enough. Use **Assign** per row in Review.
+
+### Naming tips
+
+- Keep live channels in country-named categories, for example `USA`, `UK Sports`, `Canada`, `Portugal`. The category is used as the country hint.
+- If a category name has no country word (for example `CABLE`, `NEWS`, `LOCAL - NBC`), add a Category hint such as `cable=us`.
+- Put the country prefix in channel names where you can (`PT | SIC`, `CA | TSN 3`).
+- Keep the call sign in names of local stations.
+- Use separate categories for 24/7 loops and for event slots. Then they are easy to put under Not EPG-able categories.
+
+### Works with any providers and channels
+
+Nothing is tied to specific providers or channel lists. Providers can be added or deleted at any time. If your panel is not US-based, set the Home country and review the built-in tag and category lists before the first run. Always press **Preview** and spot-check a few channels before **Assign now**.
+
 ## Upgrade and migration
 
 **Automatic, once only.** The first time `crons/epg.php` runs on the new build, it changes the `epg_data` table (only that table):
