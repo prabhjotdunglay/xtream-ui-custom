@@ -674,3 +674,141 @@ Matching quality was reworked after a test on a real list of 12,651 live channel
 - An independent hold-out set is not labelled yet, so the precision numbers are not independent.
 - One-click category accept is dormant until reasons are measured.
 - Very large providers (for example a 1.9 GB XMLTV) are loaded fully by the existing `crons/epg.php` and need several GB of RAM. Smaller per-country files are lighter.
+
+## 12. Gzip for panel list responses (nginx only)
+Shipped in `main_FINAL.zip`. Only `nginx/conf/nginx.conf` changed: 81 lines added, 0 removed. No PHP, config, `install.py` or
+`database.sql` change.
+
+### 12.1 What changed
+- Four exact-match locations in the stream server (ports 8080 / 443): `/player_api.php`, `/get.php`, `/xmltv.php`, `/panel_api.php`.
+  Each is a copy of the `location ~ \.php$` block plus: `gzip on; gzip_comp_level 5; gzip_min_length 1024; gzip_proxied any;
+  gzip_vary on; gzip_types application/json application/xml application/octet-stream;`.
+- `gzip off;` in `http{}` is unchanged. The admin panel (8880 / 2053) and the ISP server (8805) are unchanged.
+- `gzip_types` match what the scripts send: `player_api.php` JSON, `xmltv.php` XML, `get.php` `application/octet-stream`,
+  `panel_api.php` the PHP default `text/html` (nginx always compresses that). `application/octet-stream` is listed only inside
+  these four blocks, so static files are not affected.
+- No PHP script compresses its own output and `zlib.output_compression` is Off, so nothing is compressed twice.
+
+### 12.2 Behaviour
+- nginx compresses only when the client sends `Accept-Encoding: gzip`. Other clients get identical bytes, `Content-Length` and keep-alive as before.
+- Compressed responses have no `Content-Length` (the config has `chunked_transfer_encoding off`), so they end when the
+  connection closes. All tested HTTP clients handle this; a progress bar may not know the total size.
+- HTTP/1.0 requests and HEAD requests are not compressed.
+- Video is never compressed. `/live`, `/movie`, `/series`, `/hls`, `/timeshift` are rewritten to `/streaming/*.php` before location
+  matching and cannot match the four exact URLs. All of them and static `.mkv` / `.ts` were tested with gzip, deflate and
+  identity: no `Content-Encoding`, body identical to the source. Range requests still return 206 with the right bytes.
+
+### 12.3 Measured (nginx 1.27.0, synthetic data shaped like the panel, level 5)
+| Response | Plain | Gzipped |
+|---|---|---|
+| VOD list (`get_vod_streams`) | 28.9 MB | 5.8 MB |
+| M3U (`get.php`) | 57.5 MB | 7.9 MB |
+| EPG (`xmltv.php`) | 31.1 MB | 4.6 MB |
+- The test data repeats a small vocabulary. Expect about 4-8x on real data, not the 5-12x seen here.
+- Level 5 is kept: level 1 is about 17-20% larger for half the CPU, level 6 saves only 5-12% more for about twice the CPU.
+  Expect roughly 0.5-0.7 s of one core per full M3U download. If CPU gets tight during mass refreshes, `gzip_comp_level 1` still gives about 4-6x.
+- The bundled nginx is a Linux binary, so the test used nginx 1.27.0 built from source (same version), PHP-FPM with stub scripts
+  that send the same headers as the real ones, and real OkHttp, Apple URLSession, python-requests and curl clients.
+
+### 12.4 Cloudflare
+- Cloudflare asks the origin for gzip; `gzip_proxied any` lets nginx answer it.
+- Cloudflare does not compress `application/octet-stream`, so `get.php` (M3U) is now compressed through Cloudflare for the first time.
+- Traffic from the origin to Cloudflare is about 5x lower for all four URLs.
+
+### 12.5 App support
+- Benefit (send `Accept-Encoding: gzip` and unpack it): IPTV Smarters Android / iOS, XCIPTV, TiviMate, OTT Navigator, Kodi (PVR IPTV Simple), XStreamity.
+- Unaffected (send no `Accept-Encoding`): e2m3u2bouquet, MAG / Stalker boxes, old smart-TV apps.
+- Unverified: VLC, GSE, Smart IPTV, SS IPTV, Flix IPTV.
+- No app was found that breaks. That is a search result, not a guarantee. The only possible failure is an app that sets
+  `Accept-Encoding: gzip` by hand and then does not unpack the reply. Use the diagnostic and the rollback below if one shows up.
+
+### 12.6 WARNING: nginx upgrades
+On nginx 1.30 and later, `fastcgi_keep_conn on;` combined with gzip made PHP-FPM workers hang (each gzip request leaked one FPM
+connection until all workers were stuck; seen on 1.31.8). The panel ships nginx **1.27.0**, tested OK: 0 stalls in 120 mixed requests.
+**Before any nginx upgrade, remove `fastcgi_keep_conn on;` from the four new blocks.** With it removed, 1.31.8 also showed 0 stalls.
+
+### 12.7 Apply to an existing panel
+In `/home/xtreamcodes/iptv_xtream_codes/nginx/conf/nginx.conf`, in the first `server {}` block (the one with `listen 8080;`),
+paste the four blocks right after `location /statusvideo { ... }` and before `location ~ \.php$ {`. The shipped file has them;
+copy them from there. Each block looks like this (repeat for `/get.php`, `/xmltv.php`, `/panel_api.php`):
+```nginx
+location = /player_api.php {
+	limit_req zone=one burst=8;
+	try_files $uri =404;
+	gzip on;
+	gzip_comp_level 5;
+	gzip_min_length 1024;
+	gzip_proxied any;
+	gzip_vary on;
+	gzip_types application/json application/xml application/octet-stream;
+	# the remaining lines are the same as in the location ~ \.php$ block
+	# (fastcgi_pass, fastcgi_buffers, fastcgi_keep_conn, fastcgi_param ...)
+}
+```
+Then reload (no downtime, running streams are not cut):
+```sh
+/home/xtreamcodes/iptv_xtream_codes/nginx/sbin/nginx -t && /home/xtreamcodes/iptv_xtream_codes/nginx/sbin/nginx -s reload
+```
+
+### 12.8 Live checks
+```sh
+curl -s -o /dev/null -D - -H 'Accept-Encoding: gzip' 'http://HOST:8080/player_api.php?username=U&password=P&action=get_live_streams' | grep -iE 'content-encoding|vary'
+curl -s -o /dev/null -D - -H 'Accept-Encoding: gzip' 'http://HOST:8080/movie/U/P/123.mkv' | grep -ic content-encoding
+```
+The first must show `Content-Encoding: gzip` and `Vary: Accept-Encoding`. The second (a movie URL) must print 0.
+
+### 12.9 Rollback
+Delete the four blocks, or change `gzip on;` to `gzip off;` inside them, then run the same `nginx -t && nginx -s reload` command.
+
+### 12.10 Optional one-day diagnostic: which apps send Accept-Encoding
+- Add `log_format gzdiag '$time_local|$uri|$http_accept_encoding|$http_user_agent|$sent_http_content_encoding|$body_bytes_sent';`
+  inside `http {}`, and `access_log /home/xtreamcodes/iptv_xtream_codes/logs/gzdiag.log gzdiag;` inside each of the four blocks. Reload.
+- Only `$uri` is logged, not the query string, so no passwords are written.
+- After a day, count by app (user agent) and by whether it sent gzip and got `Content-Encoding`. Then remove the `log_format`
+  and the four `access_log` lines, reload, and delete the log file.
+
+## 13. Streaming settings guidance (advice, no code change)
+- **VOD Download Speed** (`vod_bitrate_plus`) is a **percent** added on top of each movie's known bitrate, not kbps, despite its
+  tooltip. Confirmed in `clients_movie.php`: the base rate is `bitrate * 125` bytes/s, then `+= bitrate * vod_bitrate_plus * 0.01`.
+  - `0` = the movie is sent at exactly its own bitrate, so the player's buffer never builds.
+  - For a 1 Gbps VOD server with about 50 busy-hour viewers: start at **50**, raise to **100** if network out stays well below
+    about 800 Mbps at peak. Avoid 200.
+  - Movies with no known bitrate are not throttled at all.
+- **VOD Download Limit** (`vod_limit_at`) sets the point (a percentage of the file) after which throttling starts. What `0` means is unverified.
+- **Live:** Client Prebuffer 30, Use Nginx Buffer off. Change and test one at a time.
+- **Live Connections status colour** shows divergence: green up to 10%, yellow 11-50%, red over 50% of data delivered below the
+  stream bitrate. Streams with no known bitrate always show green.
+- **High-bitrate files** (20-90 Mbps 4K): give them separate 4K categories / packages. Per-viewer adaptive quality is not supported
+  by the apps or the panel for VOD without heavy transcoding.
+
+## 14. Roadmap (planned, NOT built)
+
+### 14.1 Planned: multi-provider restream sources
+Nothing here is implemented. The plain-English challenge list is in `PROVIDER_CHALLENGES.md`; the technical findings live outside this repo.
+
+Problems to solve:
+1. Finding a channel on each provider is manual.
+2. We do not know if a provider's copy plays until it is tested by hand.
+3. The panel always tries source 1 first.
+4. We do not know which provider is good for a channel until customers complain.
+5. Providers differ in size and connection limits.
+6. Providers add and remove channels.
+7. Connections are used unevenly (one provider full, another idle).
+8. We do not know which channels are watched most (cold starts on on-demand channels, idle always-on channels).
+9. The panel only fails over on hard failures, not on buffering or freezing.
+10. We cannot tell when a provider is full.
+
+Phases (built like EPG auto-assign: Preview first, undo, nothing touches manual links):
+- **P0:** most-viewed report and provider usage view (read-only).
+- **P1:** provider M3U import; auto-fill sources with the EPG matcher; channel checker that uses only spare connections; dead-source cleanup and alerts.
+- **P2:** best source first, ordered from passive health scores.
+- **P3:** load spreading by free provider connections; on-demand / always-on switching.
+- **P4:** auto-switch when a playing source stalls.
+
+Open questions: is "Save closed connection logs to database" on and how many days of history exist; what one provider M3U line looks like
+(use XXXX placeholders); does a full provider give an error or a "limit reached" video; should new provider channels be created or only listed;
+main server upload speed and number of LBs pulling from it. Choosing the provider at the exact start moment needs a change in an obfuscated file or a workaround.
+
+### 14.2 minimus.tv comparison
+Items worth adopting later: compressed lists (done, section 12); better attack blocking (shared-IP aware, temporary escalating blocks
+on all servers, real client IP, count failures on `get.php` / `portal.php`); adding a server to all channels in one step.
