@@ -917,9 +917,47 @@ Section 17 covers the round 19 Community card removal, logo and favicon, and ser
 - `scripts/build_sub_final.py` cannot run any more, because it reads the deleted `lbznuff/` folder. It is kept in the repo for reference only (it documents the 34 decoder-damage patches in 16.3 and 16.4).
 - The REDSS comparison claims in 16.4 and 17 stand as written at the time. They cannot be re-checked now.
 ### 18.4 Release checklist
-1. Upload to the GitHub release `v1` (replace old assets): `main_FINAL.zip` (281,087,166 bytes), `sub_FINAL.zip` (167,330,742 bytes) and `sub_FINAL.zip.sha256`. The zips are not in git (`*.zip` is gitignored).
+1. Upload to the GitHub release `v1` (replace old assets): `main_FINAL.zip` (281,087,166 bytes; 281,087,773 after round 21, see 19.3), `sub_FINAL.zip` (167,330,742 bytes) and `sub_FINAL.zip.sha256`. The zips are not in git (`*.zip` is gitignored).
 2. Upload `gtb_report.php` to `thesocialclub.co.in/gtb/` and `gtb_report.htaccess` as `.htaccess` in the same folder (see 16.2). Check that the log file is not served over HTTP and that the token matches `install-lb`.
 3. LB one-liner (Ubuntu 24.04 or 22.04, as root):
    `wget -O install-lb "https://raw.githubusercontent.com/prabhjotdunglay/xtream-ui-custom/main/install-lb"; chmod +x install-lb; ./install-lb`
 4. Main panel one-liner (from README): `rm -rf install.py && wget -qO install.py https://raw.githubusercontent.com/prabhjotdunglay/xtream-ui-custom/main/install.py && sudo python3 install.py`
 5. Server buttons (Restart services, Reboot server, Fast reload main) need sshd root login: in Edit Server enter the root SSH password and port 22, and on every target set `PermitRootLogin yes` in `/etc/ssh/sshd_config`, then reload sshd. Alternative: a key file at `adtools/balancer_key` with `PermitRootLogin prohibit-password`.
+## 19. Round 21: leak killer fix, sweep, GitHub clean-up, install report
+### 19.1 Leak killer (`crons/kill_leaks.php`)
+- **What was wrong:** the loop reads `while ($row = $result->fetch_assoc())` but the body used `$rRow["server_id"]` and `$rRow["pid"]`, which are undefined (decoder damage). Every pass called `sexec()` with no server and no pid, so it could never kill anything.
+- **Intended logic:** rows in `user_activity_now` with `user_id = 0` are leaked connections that belong to no user. Their pid should be killed.
+- **Fix:** `$rRow` renamed to `$row`, plus guards so it is safe to run every minute: pid must be above 1; pids owned by running streams are skipped (`streams_sys` pid, monitor_pid, delay_pid per server, and `streams.tv_archive_pid`); the process is killed only if `ps -p PID -o comm=` starts with `php` or `ffmpeg`, checked on the target server (guards against pid reuse); the leaked row is deleted afterwards so the pid is never killed twice. Remote servers use the existing `sexec()` path. nginx, the php-fpm master, the panel cron and stream processes are not touched. This is more than the one-word minimum fix; it only reduces kill risk.
+- **Scheduled?** No. `install.py` only has `@reboot start_services`, `geolite_update.php` (daily) and `setup_cache.php` (every minute). No cron runs `kill_leaks.php`, and the panel's own crontab is built in obfuscated code that cannot be inspected. Nothing was added. To schedule it, add this to `/etc/crontab` on the main server:
+  `* * * * * xtreamcodes /home/xtreamcodes/iptv_xtream_codes/php/bin/php /home/xtreamcodes/iptv_xtream_codes/crons/kill_leaks.php > /dev/null 2>&1`
+- **Community tab:** one line added under Security: "Leak killer: optional cron job that clears stuck connections of unknown users (not scheduled by default)". This replaces the "Leak killer: omitted" entry in 18.1.
+- **Tested:** `php -l` and a stub test (fake DB and fake `sexec`) on macOS: protected pids and pids 0/1 not killed, other pids get the guarded kill, all leaked rows deleted. **Not tested:** real SQL, a real kill on Linux, or the panel on a server. Run it once by hand on the server before scheduling it.
+
+### 19.2 Sweep of readable PHP (crons, tools, SecTools, admin; 208 files)
+- Checked for undefined variables, undefined functions, `while(false)`, `if(false)` and `* 0` patterns with throw-away scripts (not committed). Only `kill_leaks.php` was fixed. Hits in HTMLPurifier and already-fixed float literals are not bugs.
+- **Left unfixed, intent unknown (ASK):**
+  1. `admin/duplicate_movies.php:18` and `admin/tables_mb.php:18` call `flushDuplicateMovies()`, which is not defined. Fatal if `?flushduplicatemovies` is requested.
+  2. `admin/api.php:1189` (action=streams with stream_ids) calls undefined `getStreams()`. Only that API action fails.
+  3. `admin/log_tools.php:29` and `:271` use undefined `$daysToClear`; the default number of days is unknown.
+  4. `tools/stream_monitor.php` (~lines 62-66): the scheduled-restart block has only empty branches. The action was probably lost by the decoder.
+  5. `mcrypt_*` (gauth.php, reseller/class.resellerapi.php, resellersmarters.php) and `get_magic_quotes_gpc` (database.php) need extensions the shipped PHP 7.2 build may lack. Not verified.
+
+### 19.3 `main_FINAL.zip` (new size)
+- Backup: `main_FINAL.zip.bak21` (281,087,166 bytes). **New `main_FINAL.zip`: 281,087,773 bytes**, 17,299 entries, same order, same `external_attr` and date for every entry, `testzip()` clean. Only `admin/settings.php` and `crons/kill_leaks.php` differ from the backup. Untouched entries were re-deflated.
+- Marker checks all passed (same list as 18.2, plus no `.obf.bak` or `.pyc`). BASE has the same two files. `sub_FINAL.zip` and its `.sha256` are unchanged. Release checklist 18.4 item 1 now reads 281,087,773 bytes for `main_FINAL.zip`.
+- `BUILD_NOTES.md` is not inside the zip, so the zip was not touched for this docs update.
+
+### 19.4 GitHub clean-up (repo `xtream-ui-custom`, branch `main`)
+- **Removed:** `lb-fix.sh` (a standalone patch for old LBs, already included in `sub_FINAL.zip`, not used by `install.py` or `install-lb`), `__pycache__/install.cpython-313.pyc` and `pytools/__pycache__/config.cpython-313.pyc` (generated files that should never be tracked). `.gitignore` now has `__pycache__/` and `*.pyc`. The `lb-fix.sh` mentions in sections 16.x were removed or reworded. Branch `vod-heal` is untouched.
+- `scripts/build_sub_final.py` is kept as a record only (its header says it cannot run, because `lbznuff/` is gone).
+- **Kept:** `install.py`, `install-lb`, `gtb_report.php`, `gtb_report.htaccess`, `pytools/config.py`, `GeoLite2.mmdb`, `sub_FINAL.zip.sha256`, README, BUILD_NOTES, `EPG_AUTO_ASSIGN.md`, `smoke_test.py`, `tools/*`.
+- **ASK (not removed):** `tools/series_dedupe.py` and `tools/SERIES_DEDUPE_GUIDE.md` (standalone helper, not used by the installers); `EPG_AUTO_ASSIGN.md` (kept as an EPG guide); `GeoLite2.mmdb` (binary in git, unclear whether `install-lb` still needs it).
+- **Is our LB installer independent of znuff?** `install-lb` downloads `sub_FINAL.zip` and `sub_FINAL.zip.sha256` from our GitHub release `v1` and checks the sha256 (if the `.sha256` cannot be fetched it warns and skips the check). It does not call any znuff URL, so it installs without his installer.
+
+### 19.5 How to check which servers installed from our LB installer
+- `install-lb` posts one record per finished install to `REPORT_URL` (default `https://www.thesocialclub.co.in/gtb/report.php`) with the token in the `X-GTB-Token` header.
+- `report.php` appends **one JSON line per install** to **`gtb-install-report.log` in the same folder as `report.php`** (`/gtb/` on thesocialclub.co.in). The `.htaccess` in that folder denies web access to `*.log` and to `.gtb-rate-limit`.
+- Fields: `ip`, `hostname`, `ubuntu_version`, `installer_version`, `timestamp` (UTC, set by the LB). The server also adds `received_at` and `remote_addr`.
+- View it with the hosting file manager, FTP, or SSH, for example `cat gtb-install-report.log` or `tail -n 20 gtb-install-report.log` in that folder.
+- Each LB also keeps its own local log, `/var/log/gtb-install-report.log`, with the same five fields (no `received_at` or `remote_addr`).
+- **Corrections to the task wording:** in the repo the files are named `gtb_report.php` and `gtb_report.htaccess`; on the host they must be uploaded as `report.php` and `.htaccess`. The comment in `gtb_report.php` prefers a log outside the web root, but the shipped `LOG_FILE` is inside the folder, so the `.htaccess` is what protects it. The report is sent only if `REPORT_URL` is non-empty, and a failed POST is ignored silently. The sender token is hard-coded in both files and must match.
