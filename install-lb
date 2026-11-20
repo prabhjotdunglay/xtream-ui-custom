@@ -208,6 +208,7 @@ After=fpm@streamer.service nginx-xc.service
 Type=oneshot
 User=xtreamcodes
 RemainAfterExit=yes
+KillMode=process
 ExecStart=$XC_BASE/systemd_start_script.sh
 
 [Install]
