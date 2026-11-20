@@ -97,12 +97,12 @@ def main():
         return
 
     # encrypt
-    if args.create == "yes" and not (args.host and args.password and args.server_id):
+    if args.create == "yes" and not (args.host and args.db_pass and args.server_id):
         # blank placeholder config, filled in later by a real encrypt call
         encrypt("127.0.0.1", args.db_user, "", args.db_name, 0, args.db_port)
         return
 
-    if not (args.host and args.password and args.server_id):
+    if not (args.host and args.db_pass and args.server_id):
         print("Usage: config.py --id <id> --host <host> --port <port> --password <password> encrypt")
         sys.exit(1)
 
