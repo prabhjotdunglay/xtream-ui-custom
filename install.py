@@ -703,13 +703,22 @@ def httpCode(rPort):
     except OSError: return "000"
     return rOut or "000"
 
+def portListening(rPort):
+    # True/False from `ss -ltn`; None when ss is unavailable.
+    try:
+        rOut = subprocess.run(["ss", "-ltn"], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, universal_newlines=True).stdout
+    except OSError: return None
+    return any(rLine.split()[3:4] and rLine.split()[3].endswith(":%d" % rPort) for rLine in rOut.splitlines()[1:])
+
 def healthProblems(rWait=30):
     # Waits up to rWait seconds for nginx, nginx_rtmp, php-fpm and the :8880 / :8080 ports; returns what is still wrong.
     rProblems = []
     for rTry in range(max(1, rWait // 3)):
         rProblems = [rName + " is not running" for rName in ["nginx", "nginx_rtmp", "php-fpm"] if not procRunning(rName)]
         if not rProblems:
-            rProblems = ["port %d does not answer" % rPort for rPort in [8880, 8080] if httpCode(rPort) == "000"]
+            for rPort in [8880, 8080]:
+                if portListening(rPort) is False: rProblems.append("port %d is not listening (ss -ltn)" % rPort)
+                elif httpCode(rPort) == "000": rProblems.append("port %d is listening but does not answer (curl)" % rPort)
         if not rProblems: break
         time.sleep(3)
     return rProblems
