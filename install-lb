@@ -159,7 +159,8 @@ EOF
         python3 "$XC_BASE/pytools/config.py" --create yes --host 127.0.0.1 --port 7999 --password "" encrypt >/dev/null 2>&1
     fi
     chmod 755 "$XC_BASE/pytools/config.py" 2>/dev/null || true
-    mkdir -p /var/log/php-fpm
+    mkdir -p /var/log/php-fpm /var/log/nginx
+    chown xtreamcodes:xtreamcodes /var/log/nginx /var/log/php-fpm 2>/dev/null || true
     chown -R xtreamcodes:xtreamcodes "$XC_BASE"
 }
 
