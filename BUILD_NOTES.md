@@ -812,3 +812,14 @@ main server upload speed and number of LBs pulling from it. Choosing the provide
 ### 14.2 minimus.tv comparison
 Items worth adopting later: compressed lists (done, section 12); better attack blocking (shared-IP aware, temporary escalating blocks
 on all servers, real client IP, count failures on `get.php` / `portal.php`); adding a server to all channels in one step.
+
+## 15. GTB mods rebrand, cleanup and series duplicate fix
+Shipped in the zip only (panel PHP is never committed). Zip rebuilt from the previous build: 284,829,606 bytes (was 285,139,019), `testzip()` clean.
+- **Rebrand to "GTB mods":** Settings shows "Installed Version GTB v8" (was R1 ODIN v46). The footer reads "Xtream UI - GTB mods v8". `panel_version` logic is untouched. The ODIN names in the settings tab, login 2FA issuer, tables, radio/stream pages, language files (en, fr, es, pt, it), `database.sql` default server name, SecTools text and `install.py` banners became GTB mods / Xtream UI.
+- **Logo:** the 666x172 "odin" wordmark with the Viking (header, login, sidebar, 146x172 small logo, 1025x257 wide logo, 48x48 favicon) was replaced by the Ghostbusters logo. The outer white is transparent and the ghost stays white. The wide logos add red "GTB mods" text. The small logo and favicon are icon only. Pixel sizes are unchanged.
+- **Community tab:** new Settings tab with Telegram and Discord (https://discord.gg/xYPWB2Gysd) buttons, an optional Videos button and a short feature list. The links are editable (`community_telegram`, `community_discord`, `community_videos` in `admin_settings`, http(s) only).
+- **Cleanup:** the unused leftover `isp/api.php(don t work with https certicate)` copy of the old ISP lookup is deleted. The real `isp/api.php` stays. Xtreamcursos and Odin comments were stripped from `wwwdir/.htaccess`, `admin/.htaccess` and `nginx.conf.sec`.
+- **Series duplicates fix:** `getSeriesByTMDB` now uses `ORDER BY id LIMIT 1` and `num_rows >= 1`. One show no longer splits into many series rows on import (the "Average Joe" x20 case).
+- **Dedupe tool for existing data:** `tools/series_dedupe.py` is a standalone Python script (not panel PHP). Its guide is `tools/SERIES_DEDUPE_GUIDE.md`. It merges split shows into one series, handles slot conflicts, rewrites bouquets, and with `--orphans` removes orphan `series_episodes` / `streams_sys` rows. It only reports episodes that have no series. Run it without `--apply` first.
+- **Kept on purpose:** `odin_blocker` table and `rOdinBlocker` (functional names), `configblock_odin.php` filename, `vicodin` (spam word in nginx), `*.obf.bak` backups, binaries.
+- **Checks:** `php -l` on the changed PHP files, `py_compile` on `install.py`, and the marker list (import, episode, watch folder, EPG, nginx, blacklist, php.ini, new logo in zip) all passed. Pages were not rendered (they need the database).
