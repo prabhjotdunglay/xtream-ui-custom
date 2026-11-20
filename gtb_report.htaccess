@@ -1,0 +1,24 @@
+# Upload this as .htaccess in the SAME folder as report.php (rename this
+# file to ".htaccess" on upload -- it is named gtb_report.htaccess here only
+# because some tools/hosts hide or mangle dotfiles in transfer).
+#
+# Blocks direct HTTP access to the log and rate-limit files, in case they
+# cannot be placed outside the web root on this host.
+<FilesMatch "\.(log)$">
+    Require all denied
+</FilesMatch>
+<Files ".gtb-rate-limit">
+    Require all denied
+</Files>
+
+# Apache 2.2 fallback (ignored by 2.4+, which uses Require above)
+<IfModule !mod_authz_core.c>
+    <FilesMatch "\.(log)$">
+        Order allow,deny
+        Deny from all
+    </FilesMatch>
+    <Files ".gtb-rate-limit">
+        Order allow,deny
+        Deny from all
+    </Files>
+</IfModule>

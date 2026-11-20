@@ -42,6 +42,10 @@ rDownloadURL = {
 rRawBaseURL = "https://raw.githubusercontent.com/prabhjotdunglay/xtream-ui-custom/main"
 rGeoLiteURL = rRawBaseURL + "/GeoLite2.mmdb"
 rPidMonitorURL = rRawBaseURL + "/pid_monitor.php"
+# LB mode does not reimplement the znuff-style LB steps here; it downloads and
+# runs the standalone install-lb script (same file as the one-liner uses), so
+# the two cannot drift. See install-lb for what it does.
+rInstallLBURL = rRawBaseURL + "/install-lb"
 
 # GeoLite2: crons/geolite_update.php ships with the MaxMind account ID / license key
 # built in, keeps GeoLite2.mmdb current automatically (checked every minute by the
@@ -610,6 +614,54 @@ def ensureCloudCert(rConf="/home/xtreamcodes/iptv_xtream_codes/nginx/conf"):
     except (LookupError, PermissionError, OSError): pass
     return rResult
 
+def installLB():
+    # LB mode reuses the standalone install-lb script (readable bash, no opaque
+    # binary) instead of a separate code path here, so the one-liner install
+    # and this menu option can never drift apart. install-lb does its own
+    # package/user/systemd/cron/payload steps and prints the config.py link
+    # command at the end; see install-lb for the full step list.
+    printc("Downloading install-lb")
+    rScriptPath = "/tmp/install-lb"
+    try:
+        subprocess.run(['curl', '-L', '-s', '-o', rScriptPath, rInstallLBURL], check=True)
+    except subprocess.CalledProcessError:
+        printc("Failed to download install-lb!", col.BRIGHT_RED)
+        return False
+    if not os.path.exists(rScriptPath) or os.path.getsize(rScriptPath) == 0:
+        printc("Failed to download install-lb!", col.BRIGHT_RED)
+        return False
+    os.chmod(rScriptPath, 0o755)
+    printc("Running install-lb")
+    rRet = subprocess.run(["bash", rScriptPath])
+    if rRet.returncode != 0:
+        printc("install-lb exited with an error.", col.BRIGHT_RED)
+        return False
+    return True
+
+
+def offerLinkLB():
+    # Prints the exact config.py link command, and optionally runs it for the
+    # user if they want to enter the details now instead of doing it by hand.
+    rCmd = "/home/xtreamcodes/iptv_xtream_codes/pytools/config.py --id <server-id> --host <main-IP> --port <DB port> --password <password> encrypt"
+    printc("Link this LB to the main server with:", col.BRIGHT_YELLOW)
+    print("  %s" % rCmd)
+    print(" ")
+    if input("  Run it now interactively? [y/N]: ").strip().upper() != "Y":
+        return
+    rServerID = input("  Server ID: ").strip()
+    rHost = input("  Main Server IP Address: ").strip()
+    rPort = input("  DB Port [7999]: ").strip() or "7999"
+    rPassword = input("  MySQL Password: ").strip()
+    if not (rServerID and rHost and rPassword):
+        printc("Missing details, skipped.", col.BRIGHT_RED)
+        return
+    subprocess.run([
+        "/home/xtreamcodes/iptv_xtream_codes/pytools/config.py",
+        "--id", rServerID, "--host", rHost, "--port", rPort,
+        "--password", rPassword, "encrypt",
+    ])
+
+
 CERT_REMINDER = [
     "Temporary self-signed SSL certificate created.",
     "Replace with your Cloudflare Origin certificate:",
@@ -630,17 +682,22 @@ if __name__ == "__main__":
     print(" ")
     rType = input("  Installation Type [MAIN, LB]: ")
     print(" ")
-    if rType.upper() in ["MAIN", "LB"]:
-        if rType.upper() == "LB":
-            rHost = input("  Main Server IP Address: ")
-            rPassword = input("  MySQL Password: ")
-            try: rServerID = int(input("  Load Balancer Server ID: "))
-            except: rServerID = -1
+    if rType.upper() == "LB":
+        # LB mode: delegates everything to the standalone install-lb script
+        # (see installLB()). It does not touch MAIN's prepare()/install()/
+        # mysql()/configure() flow below at all.
+        printc("Start LB installation? Y/N", col.BRIGHT_YELLOW)
+        if input("  ").upper() == "Y":
             print(" ")
+            if not installLB(): sys.exit(1)
+            print(" ")
+            offerLinkLB()
         else:
-            rHost = "127.0.0.1"
-            rPassword = generate()
-            rServerID = 1
+            printc("Installation cancelled", col.BRIGHT_RED)
+    elif rType.upper() == "MAIN":
+        rHost = "127.0.0.1"
+        rPassword = generate()
+        rServerID = 1
         rUsername = "user_iptvpro"
         rDatabase = "xtream_iptvpro"
         rPort = 7999
@@ -650,34 +707,29 @@ if __name__ == "__main__":
                 print(" ")
                 rRet = prepare(rType.upper())
                 if not install(rType.upper()): sys.exit(1)
-                if rType.upper() == "MAIN":
-                    if not mysql(rUsername, rPassword): sys.exit(1)
+                if not mysql(rUsername, rPassword): sys.exit(1)
                 encrypt(rHost, rUsername, rPassword, rDatabase, rServerID, rPort)
                 configure()
-                modifyNginx(rType.upper() == "MAIN")
-                rCert = None
-                if rType.upper() == "MAIN":
-                    rCert = ensureCloudCert()
-                    if rCert in ("generated", "fallback"):
-                        for rLine in CERT_REMINDER: printc(rLine, col.BRIGHT_YELLOW)
-                if rType.upper() == "MAIN":
-                    finalize()
+                modifyNginx(True)
+                rCert = ensureCloudCert()
+                if rCert in ("generated", "fallback"):
+                    for rLine in CERT_REMINDER: printc(rLine, col.BRIGHT_YELLOW)
+                finalize()
                 start()
                 updateGeoLite()
                 printc("Applied: " + ", ".join(rApplied), col.BRIGHT_GREEN)
                 printc("Installation completed!", col.GREEN, 2)
-                if rType.upper() == "MAIN":
-                    printc("Please store your MySQL password: %s" % rPassword, col.BRIGHT_YELLOW)
-                    printc("Admin UI Wan IP: http://%s:8880 (https on 2053)" % getIP(), col.BRIGHT_YELLOW)
-                    printc("Admin UI default login is admin/admin", col.BRIGHT_YELLOW)
-                    printc("Credentials saved to /root/credentials.txt", col.BRIGHT_YELLOW)
-                    rFile = open("/root/credentials.txt", "w")
-                    rFile.write("MySQL password: %s\n" % rPassword)
-                    rFile.write("Admin UI Wan IP: http://%s:8880 (https on 2053)\n" % getIP())
-                    rFile.write("Admin UI default login is admin/admin\n")
-                    if rCert in ("generated", "fallback"):
-                        rFile.write("\nNOTE: " + " ".join(CERT_REMINDER) + "\n")
-                    rFile.close()
+                printc("Please store your MySQL password: %s" % rPassword, col.BRIGHT_YELLOW)
+                printc("Admin UI Wan IP: http://%s:8880 (https on 2053)" % getIP(), col.BRIGHT_YELLOW)
+                printc("Admin UI default login is admin/admin", col.BRIGHT_YELLOW)
+                printc("Credentials saved to /root/credentials.txt", col.BRIGHT_YELLOW)
+                rFile = open("/root/credentials.txt", "w")
+                rFile.write("MySQL password: %s\n" % rPassword)
+                rFile.write("Admin UI Wan IP: http://%s:8880 (https on 2053)\n" % getIP())
+                rFile.write("Admin UI default login is admin/admin\n")
+                if rCert in ("generated", "fallback"):
+                    rFile.write("\nNOTE: " + " ".join(CERT_REMINDER) + "\n")
+                rFile.close()
                 printc("Installation done. It is recommended to REBOOT the server now: reboot", col.BRIGHT_YELLOW)
             else: printc("Installation cancelled", col.BRIGHT_RED)
         else: printc("Invalid entries", col.BRIGHT_RED)

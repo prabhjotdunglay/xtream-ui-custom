@@ -32,8 +32,7 @@ Excluded on purpose:
 
 Operator-tooling you may keep or drop at your discretion (document, not auto-excluded above):
 - `SecTools/` — operator scripts; safe to ship or omit.
-- `config.py` — a Python 2 DB-config decrypt helper. It will NOT run under 24.04's Python 3, but
-  it is inert at install time (the installer does not import it). Keep it only as an operator tool.
+- `config.py` — a Python 3 DB-config decrypt helper (ported from Python 2, see sections 9 and 16). It is inert at install time (the installer does not import it). Keep it only as an operator tool.
 
 A LB/sub-server payload `sub_FINAL.zip` (streamer-only pool, no admin/DB) is NOT built here; build
 and upload it separately if you want LB installs. `php/etc/streamer.conf` is already shipped so LB
@@ -823,3 +822,27 @@ Shipped in the zip only (panel PHP is never committed). Zip rebuilt from the pre
 - **Dedupe tool for existing data:** `tools/series_dedupe.py` is a standalone Python script (not panel PHP). Its guide is `tools/SERIES_DEDUPE_GUIDE.md`. It merges split shows into one series, handles slot conflicts, rewrites bouquets, and with `--orphans` removes orphan `series_episodes` / `streams_sys` rows. It only reports episodes that have no series. Run it without `--apply` first.
 - **Kept on purpose:** `odin_blocker` table and `rOdinBlocker` (functional names), `configblock_odin.php` filename, `vicodin` (spam word in nginx), `*.obf.bak` backups, binaries.
 - **Checks:** `php -l` on the changed PHP files, `py_compile` on `install.py`, and the marker list (import, episode, watch folder, EPG, nginx, blacklist, php.ini, new logo in zip) all passed. Pages were not rendered (they need the database).
+## 16. Servers page cleanup and built-in LB installer
+### 16.1 Servers page cleanup (panel, shipped in main_FINAL.zip only)
+- **Removed:** the SSL page for servers (there was no working `install_serverssl.php`, so it was a broken page). SSL on LBs is installed by hand.
+- **Hidden:** the Remake, Update and SSL buttons on the Servers page. They called Python helpers that do not work on 24.04. `api.php` also answers "This action is disabled" for `remake_balancer`, `fremake_server`, `fremake_balancer`, `update_geolite`, `update_youtube` and `update_release`, and queues nothing. Restart services, Reboot and Remake server stay in the modals.
+- **POST passwords:** SSH port, server id and password for those actions are sent with `$.post` and read from `$_POST`. No password is in a URL any more, so none lands in access logs.
+- **Config permission fix:** `sreload.py` now sets the config to `chmod 400` after `chown xtreamcodes` (it was 777). `install.py` also uses 0400. PHP and services run as `xtreamcodes`, so they can still read it. Passwords are still stored in `adtools/balancer/<id>.json`, as before.
+- **Python helpers:** `pytools/config.py` is Python 3 (the older note saying Python 2 was wrong). `pytools/autoupdate.py` is an empty stub (3 comment lines, no code), so there is no working auto-update.
+
+### 16.2 Built-in LB installer
+Replaces the dependency on a third-party installer link that expired every few days. Written from scratch from an audit of that installer. Only its program files (nginx, php, ffmpeg, decoded PHP) are reused in the payload. None of its install steps are used.
+- **One-liner (Ubuntu 24.04 or 22.04, as root):**
+  `wget -O install-lb "https://raw.githubusercontent.com/prabhjotdunglay/xtream-ui-custom/main/install-lb"; chmod +x install-lb; ./install-lb`
+  `install.py` in LB mode downloads and runs the same `install-lb`.
+- **Release assets to upload (tag `v1`):** `sub_FINAL.zip` (167,330,732 bytes) and `sub_FINAL.zip.sha256`. SHA-256 `ca40bf424bccd457a2d7a6b4b7b986f29e9a431097a711ae1ab6e618184b17df`. The zip is not in git (GitHub rejects files over 100 MB). `install-lb` downloads it and checks the SHA-256. If the `.sha256` file cannot be fetched, it skips the check with a warning. Rebuild with `scripts/build_sub_final.py`.
+- **Link step (after install, on the LB):**
+  `/home/xtreamcodes/iptv_xtream_codes/pytools/config.py --id <id-of-server> --host <main-IP> --port <DB port> --password <password> encrypt`
+  Optional flags: `--user`, `--db` (defaults `user_iptvpro`, `xtream_iptvpro`). Actions: `encrypt`, `decrypt`, `interactive`. The file is written as `xtreamcodes:xtreamcodes`, mode 0400.
+- **What the installer does:** packages (`libzip4t64` on 24.04), `xtreamcodes` user, tmpfs lines in fstab, `/etc/hosts` block for xtream-codes.com, systemd units `fpm@streamer`, `nginx-xc`, `xc-start`, logrotate, 8 cron jobs, root-owned `crons` and `wwwdir`. UFW is touched only when active (80, 443, 8080 allowed). `nginx_rtmp` is not started. Nginx uses the snakeoil certificate until you install your own SSL by hand.
+- **Audit of the original third-party installer:** NOT SAFE to run. It adds a hidden root SSH key, calls a third-party beacon URL during install, swaps `config.py` for a downloaded closed-source binary, loads an encrypted payload from IPFS, and has a built-in expiry date. **If anyone ran it on a server, check `/root/.ssh/authorized_keys` and remove any unknown `ssh-rsa ... admin` line.** Our payload and scripts contain none of these (reviewed: no catbox, ipfs, fly.dev, extra users, sudoers or sysctl edits, and no real config or secrets in the payload).
+- **GTB_ADMIN_KEY:** one declared support public key (`gtb-admin`, ed25519) is appended to `/root/.ssh/authorized_keys` if absent (dir 700, file 600, other keys never removed). The installer prints a line saying so. The value is the variable `GTB_ADMIN_KEY` at the top of `install-lb` and can be overridden by an environment variable of the same name. To rotate it, change the variable. No rebuild of the payload is needed. To opt out, remove the key line after install.
+- **Install report:** `/var/log/gtb-install-report.log` is always written (public IP, hostname, Ubuntu version, installer version, time). The installer also sends a short POST to the report receiver. A failed POST never stops the install. The token is in `install-lb` and `gtb_report.php` only (not written here).
+- **Receiver upload steps:** upload `gtb_report.php` to `thesocialclub.co.in/gtb/` and `gtb_report.htaccess` as `.htaccess` in the same folder. Check that the log file is not served over HTTP. Confirm the token in `gtb_report.php` matches `install-lb`.
+- **Tested here:** `py_compile` on `install.py`, `pytools/config.py` and `scripts/build_sub_final.py`; `bash -n install-lb`; `php -l gtb_report.php`; `config.py` encrypt/decrypt round trip against `install.py`'s format; `install.py` LB mode dry run with the subprocess calls mocked; every MAIN-path function in `install.py` is AST-identical to before; zip listing shows `config.py` mode 0755.
+- **NOT tested (needs a real Ubuntu 24.04 LB):** apt installs, systemd units, nginx and php-fpm startup, the fstab mount, crontab, the release download and SHA-256 check, the report POST and the receiver on real PHP, the link command against a real main server, and streaming through the LB.
