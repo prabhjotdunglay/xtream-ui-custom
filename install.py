@@ -1,7 +1,7 @@
 #!/usr/bin/python3
 # -*- coding: utf-8 -*-
 #
-# XC-UI Custom Installer (Ubuntu 24.04 only, PHP 7.4, no IonCube)
+# GTB mods Installer (Ubuntu 24.04 only, PHP 7.4, no IonCube)
 #
 # Structure is based on a community Xtream-UI installer but has been
 # neutralised and hardened for this custom build:
@@ -305,8 +305,8 @@ def mysql(rUsername, rPassword):  # handles db setup
                 os.system("mysql -u root%s xtream_iptvpro < /home/xtreamcodes/iptv_xtream_codes/database.sql > /dev/null" % rExtra)
                 os.system('mysql -u root%s -e "USE xtream_iptvpro; DROP TABLE IF EXISTS odin_blocker; %s" > /dev/null' % (rExtra, rOdinBlocker))
                 os.system('mysql -u root%s -e "USE xtream_iptvpro; UPDATE settings SET live_streaming_pass = \'%s\', unique_id = \'%s\', crypt_load_balancing = \'%s\';" > /dev/null' % (rExtra, generate(20), generate(10), generate(20)))
-                # Pin the displayed version to "R1 ODIN v46" (the "46" comes from
-                # admin_settings.panel_version; $rRelease="R1" + $rEarlyAccess=" ODIN v").
+                # Pin the displayed version to "GTB v8" (the "46" below stays the internal panel_version; the label
+                # comes from $rRelease="GTB" + $rEarlyAccess=" v" + $rGTBVersion="8" in functions.php).
                 # panel_version / geolite2_version live in the admin_settings key/value
                 # table (type/value), not in `settings`, so seed them there. Seed a
                 # current-ish geolite2_version so no GeoLite "update available" nag shows.
@@ -495,8 +495,8 @@ def updateGeoLite():
     rApplied.append("GeoLite2 update started")
 
 def start(first=True):
-    if first: printc("Starting Xtream Codes")
-    else: printc("Restarting Xtream Codes")
+    if first: printc("Starting GTB mods")
+    else: printc("Restarting GTB mods")
     os.system("/home/xtreamcodes/iptv_xtream_codes/start_services.sh > /dev/null")
 
 def insertNginxBlock(rPath, rGuard, rBlock):
@@ -626,7 +626,7 @@ if __name__ == "__main__":
     if not rVersion in rVersions:
         printc("This installer supports Ubuntu 24.04 ONLY.", col.BRIGHT_RED)
         sys.exit(1)
-    printc("XC-UI Custom Installer - Ubuntu %s" % rVersion, col.GREEN, 2)
+    printc("GTB mods Installer - Ubuntu %s" % rVersion, col.GREEN, 2)
     print(" ")
     rType = input("  Installation Type [MAIN, LB]: ")
     print(" ")
