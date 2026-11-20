@@ -856,3 +856,14 @@ Replaces the dependency on a third-party installer link that expired every few d
 - **Already-installed LBs:** run `lb-fix.sh` as root (no reinstall). It checks the SHA-256, extracts only the 12 files, adds `KillMode=process` to the unit, stops old daemons, restarts `xc-start`, then runs `servers_checker.php` once.
 - **Not tested:** no real LB, no patched PHP against a real DB or under PHP 7.2, no systemd run. The heartbeat UPDATE SQL was run on a local MySQL only.
 - **Panel setting:** the panel row has `https_broadcast_port` 8443 while the LB nginx listens on 443. Change it in the panel.
+
+### 16.4 PHP-FPM parity patch, REDSS LB comparison, needrestart finding
+- **PHP-FPM `process.dumpable = yes`:** `scripts/build_sub_final.py` now patches `php/etc/streamer.conf` (exact match, once), placing the line after the commented `access.format` line and a blank line, as in BASE and the REDSS LB copy. That is 34 patches in total. `fpm@streamer` runs as `User=xtreamcodes`, so the setting has no effect today. It only matters if fpm is ever started as root.
+- **REDSS LB comparison (file diff only, no real LB run):**
+  - Confirmed: the 9 wwwdir files checked (clients_live, clients_movie, timeshift, streaming, stream, lib, functions, system_api, init) and the rest of wwwdir are byte-identical to the REDSS LB copy. They are original files, not decoder output.
+  - Not confirmed: the REDSS LB `crons/` and `tools/` are ionCube-encoded and cannot be read or diffed here. They stay as audited against BASE. Binary behaviour (php, php-fpm, nginx, ffmpeg) was not compared.
+  - No new decoder damage found. Config differences (ports, three fpm pools vs one, `least_conn` balance, nginx_rtmp ports) are version differences, not bugs, and were not patched.
+  - The REDSS LB folder contains `php/include/php/main/secure_dns_telemetry.h` (a DNS telemetry client header). No reference to it was found in its binaries by string search. Do not take binaries from that folder.
+- **needrestart / unattended-upgrades:** on a fresh Ubuntu 24.04 VPS, a long unattended upgrade ran needrestart, which restarted `fpm@streamer` every ~10-60 s and dropped viewers. `install-lb` and `lb-fix.sh` now write `/etc/needrestart/conf.d/gtb.conf` with `override_rc` set to 0 for `^fpm@`, `^nginx-xc` and `^xc-start`. `install-lb` also upgrades the system before the services start. Not run on a real LB.
+- **New zip:** 167,330,742 bytes, SHA-256 `2f87d9745b6d2e9647ce9d9bdf75e2d382539609b367ff533ed2869bce9a283a`. It differs from the previous zip in `php/etc/streamer.conf` only. This supersedes the size and hash in 16.3. `sub_FINAL.zip.sha256` in the repo matches.
+- **Release step (required):** re-upload `sub_FINAL.zip` and `sub_FINAL.zip.sha256` to the GitHub release `v1`, replacing the old assets. Until then `install-lb` and `lb-fix.sh` fail with a SHA-256 mismatch. The zip is not committed (`*.zip` is gitignored).
