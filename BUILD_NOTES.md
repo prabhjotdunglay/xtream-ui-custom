@@ -980,3 +980,36 @@ Section 17 covers the round 19 Community card removal, logo and favicon, and ser
 - **Still open from 19.2:** `tools/stream_monitor.php` empty scheduled-restart branches, and the `mcrypt_*` / `get_magic_quotes_gpc` calls.
 ### 20.5 Release reminder
 - **Re-upload `main_FINAL.zip` (281,088,594 bytes) to the GitHub release `v1`**, replacing the old asset. The zip is not in git.
+
+## 21. Hardened MAIN installer (install.py): failed install on Ubuntu 24.04
+### 21.1 What failed on the server
+- **Symptoms:** `mcrypt`, `libmcrypt4`, `libgeoip` (libgeoip-dev) and `nscd` were not installed although the installer printed "Installing ..." for them. `apt-cache policy` showed all of them available in `noble/universe`, and a manual `apt-get install -y libmcrypt4 libgeoip1t64` worked. `nscd` was `un` (not installed) and inactive.
+- **Symptoms:** the panel's PHP could not load `geoip.so` and `mcrypt.so` (missing shared libraries).
+- **Symptoms:** the static `nginx` and `nginx_rtmp` binaries segfault at start when the config has `user xtreamcodes;`. The user exists (`xtreamcodes:x:111:113`). The test with the `user` line removed only failed on a wrong `mime.types` path because the config was copied to /tmp, so it proved nothing yet.
+- **Hypothesis 1 (UNPROVEN): hidden apt errors.** The old installer hid apt output and removed lock files. If unattended-upgrades was running, or a concurrent full-upgrade and needrestart were active, apt could have failed without the installer noticing. The manual install output did show needrestart and a deferred `unattended-upgrades.service` restart.
+- **Hypothesis 2 (UNPROVEN): nscd.** A static glibc binary calls `getpwnam` for the `user` directive and may need `nscd` on Ubuntu 24.04. `nscd` was missing, which fits the segfault, but nothing has confirmed it.
+- Neither cause was reproduced. Nothing was run on a real Ubuntu server.
+
+### 21.2 What install.py does now (MAIN flow)
+- **Lock wait:** waits (up to 20 minutes) for apt, dpkg and unattended-upgrades to finish. Lock files are no longer deleted.
+- **Log:** all apt output goes to **`/var/log/gtb-install-apt.log`**. apt runs with `DPkg::Lock::Timeout=300`. The last lines of the log are shown when a package fails.
+- **Retries and verification:** each package gets 3 tries, then `dpkg -s` confirms it is installed (apt exit code alone is not trusted). `aptRepair()` runs between tries.
+- **Required and optional sets:** a required package that fails stops the install with a red message. An optional one is reported loudly and the install continues.
+- **Explicit packages:** `libmcrypt4`, `libgeoip1t64` (fallback `libgeoip1`) and `nscd` are installed by name. `nscd` is enabled and checked as active.
+- **needrestart override:** a `gtb.conf` setting stops needrestart from restarting services mid-install.
+- **`checkLibs()`:** runs `ldd` on php, php-fpm, ffmpeg, ffprobe and the extensions listed in php.ini. Missing libraries are mapped to packages, installed, rechecked, and the rest is reported.
+- **`startAndCheck()`:** `nginx -t` preflight, then after start checks that the processes run and ports 8880 and 8080 listen and answer (curl and `ss -ltn`). On a failure it restarts `nscd` and retries once. A crash (return code -11) prints a diagnostic. A "finished with errors" banner is printed and the exit code is non-zero.
+- **Functions:** new `aptEnv`, `protectFromAutoRestart`, `aptBusy`, `waitForApt`, `aptRun`, `aptLogTail`, `pkgInstalled`, `aptRepair`, `installPackage`, `ensureNscd`, `ensurePackages`, `phpLoadedExtensions`, `lddMissing`, `nginxPreflight`, `procRunning`, `httpCode`, `portListening`, `healthProblems`, `nginxCrashHelp`. Changed: `prepare()`, `checkLibs()`, `startAndCheck()` and the `__main__` MAIN flow lines.
+
+### 21.3 Manual recovery on a server in that state
+```
+apt-get install -y mcrypt libmcrypt4 libgeoip-dev libgeoip1t64 nscd
+systemctl enable --now nscd
+/home/xtreamcodes/iptv_xtream_codes/start_services.sh
+```
+If nginx still segfaults, check `/var/log/gtb-install-apt.log` and run `ldd` on the PHP binary and extensions.
+
+### 21.4 Tests
+- **Run:** `py_compile` OK. AST diff against the previous install.py: only `prepare()` and `checkLibs()` changed among existing functions. Mocked-subprocess tests (retry after N failures, required and optional failure, lock wait without deleting locks, ldd not-found then install and recheck, nginx return code -11) passed. Mocked health check (fake `ss` listing only 8880, curl 000 or 200) reports the right problems.
+- **Not tested:** any real Ubuntu server, docker, a real apt failure, the nscd hypothesis.
+- **Zip:** `main_FINAL.zip` was not rebuilt. The install.py inside it differs from the repo version. The installer is downloaded from raw GitHub main, so installer-only changes need no zip upload.
