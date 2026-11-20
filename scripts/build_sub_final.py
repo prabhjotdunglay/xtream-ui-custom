@@ -1,6 +1,12 @@
 #!/usr/bin/python3
 # -*- coding: utf-8 -*-
 #
+# NOTE (round 21): this script can NO LONGER RUN. It needs the original znuff LB
+# payload (lbznuff/iptv_xtream_codes/), which was deleted from the project.
+# It is kept only as the written record of the 34 decoder-damage patches applied
+# to that payload. sub_FINAL.zip is now the source of truth for the LB payload
+# (see BUILD_NOTES section 18). Do not expect to rebuild sub_FINAL.zip with it.
+#
 # Builds sub_FINAL.zip, the LB payload asset, from the recovered znuff
 # payload in lbznuff/iptv_xtream_codes/.
 #

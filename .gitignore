@@ -8,3 +8,5 @@ sub_FINAL.zip
 
 # MaxMind license key — NEVER commit
 maxmind.key
+__pycache__/
+*.pyc
