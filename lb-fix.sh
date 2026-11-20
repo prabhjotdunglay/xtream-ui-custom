@@ -57,6 +57,12 @@ if [ -f "$UNIT" ] && ! grep -q '^KillMode=process' "$UNIT"; then
     green "Adding KillMode=process to xc-start.service"
     sed -i '/^RemainAfterExit=yes/a KillMode=process' "$UNIT"
 fi
+mkdir -p /etc/needrestart/conf.d
+cat > /etc/needrestart/conf.d/gtb.conf <<'NREOF'
+$nrconf{override_rc}{qr(^fpm@)} = 0;
+$nrconf{override_rc}{qr(^nginx-xc)} = 0;
+$nrconf{override_rc}{qr(^xc-start)} = 0;
+NREOF
 systemctl daemon-reload
 
 green "Stopping old daemons"
