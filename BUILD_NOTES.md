@@ -835,7 +835,7 @@ Replaces the dependency on a third-party installer link that expired every few d
 - **One-liner (Ubuntu 24.04 or 22.04, as root):**
   `wget -O install-lb "https://raw.githubusercontent.com/prabhjotdunglay/xtream-ui-custom/main/install-lb"; chmod +x install-lb; ./install-lb`
   `install.py` in LB mode downloads and runs the same `install-lb`.
-- **Release assets to upload (tag `v1`):** `sub_FINAL.zip` (167,330,732 bytes) and `sub_FINAL.zip.sha256`. SHA-256 `ca40bf424bccd457a2d7a6b4b7b986f29e9a431097a711ae1ab6e618184b17df`. The zip is not in git (GitHub rejects files over 100 MB). `install-lb` downloads it and checks the SHA-256. If the `.sha256` file cannot be fetched, it skips the check with a warning. Rebuild with `scripts/build_sub_final.py`.
+- **Release assets to upload (tag `v1`):** `sub_FINAL.zip` (167,330,732 bytes) and `sub_FINAL.zip.sha256`. SHA-256 `62373317905f08675f648247bda35834c2dc0ef5473716012cf11c0550b16c87`. The zip is not in git (GitHub rejects files over 100 MB). `install-lb` downloads it and checks the SHA-256. If the `.sha256` file cannot be fetched, it skips the check with a warning. Rebuild with `scripts/build_sub_final.py`.
 - **Link step (after install, on the LB):**
   `/home/xtreamcodes/iptv_xtream_codes/pytools/config.py --id <id-of-server> --host <main-IP> --port <DB port> --password <password> encrypt`
   Optional flags: `--user`, `--db` (defaults `user_iptvpro`, `xtream_iptvpro`). Actions: `encrypt`, `decrypt`, `interactive`. The file is written as `xtreamcodes:xtreamcodes`, mode 0400.
