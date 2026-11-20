@@ -160,6 +160,10 @@ DECODER_DAMAGE_PATCHES = [
     ("crons/vod_checker.php", "bitrate factor 0.008 rendered as 0",
      "[$Fa2325a1b301ca7c383cb69087c42d91[\"server_id\"]] * 0 / $f3db7858a998b217cdc28e738fd2182d);",
      "[$Fa2325a1b301ca7c383cb69087c42d91[\"server_id\"]] * 0.008 / $f3db7858a998b217cdc28e738fd2182d);"),
+    # ---- php/etc/streamer.conf: parity with BASE and REDSS (LB copy too) ----
+    ("php/etc/streamer.conf", "add process.dumpable = yes (BASE/REDSS have it; keeps /proc/<pid>/exe readable if fpm master is ever root)",
+     "pool:$pool [%{HTTP_USER_AGENT}e]\"\n\n",
+     "pool:$pool [%{HTTP_USER_AGENT}e]\"\n\nprocess.dumpable = yes\n"),
 ]
 
 
