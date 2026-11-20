@@ -19,7 +19,7 @@
 #       * complete runtime directory list (created_channels, movies, delay, ...)
 #       * GeoLite2 auto-update (daily /etc/crontab + panel cron + Settings button)
 #
-import subprocess, os, random, string, sys, shutil, socket, zipfile, urllib.request, urllib.error, urllib.parse, json, base64
+import subprocess, os, time, random, string, sys, shutil, socket, zipfile, urllib.request, urllib.error, urllib.parse, json, base64
 from itertools import cycle
 from zipfile import ZipFile
 from urllib.request import Request, urlopen
@@ -56,6 +56,27 @@ rInstallLBURL = rRawBaseURL + "/install-lb"
 rPackages = ["curl", "libcurl4", "libxslt1-dev", "libgeoip-dev", "libonig-dev", "e2fsprogs", "wget", "mcrypt", "nscd", "htop", "zip", "unzip", "mc", "mariadb-server", "libpng16-16", "python3-paramiko", "python-is-python3", "libzip4t64", "iptables", "cron", "sudo", "libfreetype6", "libsqlite3-0", "libfcgi-bin"]
 rInstall = {"MAIN": "main", "LB": "sub"}
 rApplied = []  # steps that completed; printed at the end so a failed step is visible
+rErrors = []   # problems found by the package / library / health checks; any entry = "finished with errors"
+
+# Package handling (apt output goes to this log; see aptRun()).
+rAptLog = "/var/log/gtb-install-apt.log"
+# These must be installed or the installation stops. Everything else in rPackages (htop, mc) only warns.
+rRequiredPackages = ["libcurl4", "libxslt1-dev", "libgeoip-dev", "libonig-dev", "mcrypt", "nscd", "zip", "unzip", "mariadb-server", "libpng16-16", "python3-paramiko", "python-is-python3", "libzip4t64", "cron", "sudo", "libfreetype6", "libsqlite3-0", "libfcgi-bin", "iptables", "curl", "wget", "e2fsprogs"]
+# Runtime libraries the shipped PHP extensions / binaries load, installed by exact name.
+rRuntimePackages = [["libmcrypt4"], ["libgeoip1t64", "libgeoip1"]]
+# soname -> Debian/Ubuntu 24.04 package, used when ldd reports "not found".
+rLibPackages = {
+    "libmcrypt.so.4": "libmcrypt4",
+    "libGeoIP.so.1": "libgeoip1t64",
+    "libonig.so.5": "libonig5",
+    "libzip.so.4": "libzip4t64",
+    "libpng16.so.16": "libpng16-16",
+    "libfreetype.so.6": "libfreetype6",
+    "libxslt.so.1": "libxslt1.1",
+    "libsqlite3.so.0": "libsqlite3-0",
+    "libcurl.so.4": "libcurl4",
+}
+rBaseDir = "/home/xtreamcodes/iptv_xtream_codes"
 
 # MariaDB my.cnf tuned for Xtream Codes (pool-of-threads, {BUFFER_POOL_SIZE} template,
 # max_connections=8192, innodb_flush_log_at_trx_commit=0, max_statement_time=0, innodb_log_file_size=512M, port 7999).
@@ -113,6 +134,125 @@ def is_installed(package_name):
     except subprocess.CalledProcessError:
         return False
 
+def aptEnv():
+    rEnv = dict(os.environ)
+    rEnv["DEBIAN_FRONTEND"] = "noninteractive"
+    rEnv["NEEDRESTART_MODE"] = "a"
+    rEnv["NEEDRESTART_SUSPEND"] = "1"
+    return rEnv
+
+def protectFromAutoRestart():
+    # Same override as install-lb. The MAIN install creates no systemd units (start_services.sh via
+    # /etc/init.d + @reboot cron), so these rules only keep needrestart away from nginx/php-fpm
+    # processes and any LB-style units that may exist on the box. Must exist before the first apt call.
+    try:
+        os.makedirs("/etc/needrestart/conf.d", exist_ok=True)
+        with open("/etc/needrestart/conf.d/gtb.conf", "w") as rFile:
+            rFile.write("$nrconf{override_rc}{qr(^fpm@)} = 0;\n$nrconf{override_rc}{qr(^nginx-xc)} = 0;\n$nrconf{override_rc}{qr(^xc-start)} = 0;\n")
+    except OSError as e:
+        printc("Could not write needrestart override: %s" % e.strerror, col.BRIGHT_YELLOW)
+
+def aptBusy():
+    # True while any process holds an apt/dpkg lock or an apt/dpkg/unattended-upgrades process runs.
+    rLocks = [f for f in ["/var/lib/dpkg/lock-frontend", "/var/lib/dpkg/lock", "/var/lib/apt/lists/lock", "/var/cache/apt/archives/lock"] if os.path.exists(f)]
+    try:
+        if rLocks and subprocess.run(["fuser"] + rLocks, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode == 0:
+            return True
+    except OSError: pass
+    for rName in ["apt", "apt-get", "dpkg", "unattended-upgr"]:
+        try:
+            if subprocess.run(["pgrep", "-x", rName], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode == 0:
+                return True
+        except OSError: pass
+    return False
+
+def waitForApt(rTimeout=1200, rInterval=5):
+    # Never deletes lock files: they are flock-based and harmless when no process holds them.
+    rStart = time.time()
+    rShown = False
+    while aptBusy():
+        if not rShown:
+            printc("Waiting for another apt process to finish...", col.BRIGHT_YELLOW)
+            rShown = True
+        if time.time() - rStart > rTimeout:
+            printc("Another apt process still running after %d min; continuing (apt will wait on its own lock)." % (rTimeout // 60), col.BRIGHT_YELLOW)
+            return False
+        time.sleep(rInterval)
+    return True
+
+def aptRun(rArgs):
+    # Runs apt-get/dpkg with all output appended to rAptLog. Returns the exit code.
+    rCmd = list(rArgs)
+    if rCmd[0] == "apt-get":
+        rCmd = ["apt-get", "-y", "-o", "DPkg::Lock::Timeout=300", "-o", "Dpkg::Options::=--force-confdef", "-o", "Dpkg::Options::=--force-confold"] + rCmd[1:]
+    try:
+        with open(rAptLog, "a") as rLog:
+            rLog.write("\n$ %s\n" % " ".join(rCmd))
+            rLog.flush()
+            return subprocess.run(rCmd, stdin=subprocess.DEVNULL, stdout=rLog, stderr=subprocess.STDOUT, env=aptEnv()).returncode
+    except OSError as e:
+        printc("Cannot run %s: %s" % (rCmd[0], e.strerror), col.BRIGHT_RED)
+        return 127
+
+def aptLogTail(rLines=8):
+    try:
+        with open(rAptLog, "r", errors="replace") as rLog: return [l.rstrip() for l in rLog.readlines()[-rLines:] if l.strip()]
+    except OSError: return []
+
+def pkgInstalled(rPackage):
+    try:
+        rOut = subprocess.run(["dpkg", "-s", rPackage], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, universal_newlines=True)
+    except OSError: return False
+    return rOut.returncode == 0 and "Status: install ok installed" in rOut.stdout
+
+def aptRepair():
+    waitForApt()
+    aptRun(["dpkg", "--configure", "-a"])
+    aptRun(["apt-get", "install", "-f"])
+
+def installPackage(rPackage, rRequired=True, rTries=3):
+    # Install one package, verify it with dpkg -s, retry (with update + repair in between).
+    if pkgInstalled(rPackage): return True
+    printc("Installing %s" % rPackage)
+    for rTry in range(1, rTries + 1):
+        waitForApt()
+        rRet = aptRun(["apt-get", "install", rPackage])
+        if rRet == 0 and pkgInstalled(rPackage): return True
+        printc("%s: install attempt %d/%d failed (apt exit %d)" % (rPackage, rTry, rTries, rRet), col.BRIGHT_YELLOW)
+        for rLine in aptLogTail(4): print("    " + rLine)
+        if rTry < rTries:
+            time.sleep(5)
+            aptRepair()
+            aptRun(["apt-get", "update"])
+    if rRequired:
+        printc("REQUIRED package %s could not be installed. See %s" % (rPackage, rAptLog), col.BRIGHT_RED)
+    else:
+        printc("Optional package %s could not be installed (continuing). See %s" % (rPackage, rAptLog), col.BRIGHT_YELLOW)
+    return False
+
+def ensureNscd():
+    # The panel's static nginx resolves the "user xtreamcodes" directive through glibc/nscd; make sure nscd runs.
+    if not pkgInstalled("nscd"): return False
+    os.system("systemctl enable --now nscd > /dev/null 2>&1")
+    rActive = subprocess.run(["systemctl", "is-active", "nscd"], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, universal_newlines=True).stdout.strip() == "active"
+    if not rActive:
+        printc("Warning: nscd is installed but not active (systemctl status nscd)", col.BRIGHT_YELLOW)
+    return rActive
+
+def ensurePackages():
+    # Runs after the system upgrade. Returns False if a REQUIRED package is missing.
+    for rPackage in rPackages:
+        if not installPackage(rPackage, rPackage in rRequiredPackages) and rPackage in rRequiredPackages:
+            return False
+    waitForApt()
+    aptRun(["apt-get", "install", "-f"])
+    for rCandidates in rRuntimePackages:
+        if not any(installPackage(rCand) for rCand in rCandidates):
+            printc("None of %s could be installed. See %s" % (", ".join(rCandidates), rAptLog), col.BRIGHT_RED)
+            return False
+    ensureNscd()
+    return True
+
 def prepare(rType="MAIN"):
     global rPackages
     if rType != "MAIN":
@@ -150,28 +290,35 @@ def prepare(rType="MAIN"):
     if os.path.isfile('/home/xtreamcodes/iptv_xtream_codes/config'):
         os.system('chattr -i /home/xtreamcodes/iptv_xtream_codes/GeoLite2.mmdb > /dev/null')
 
-    for rFile in ["/var/lib/dpkg/lock-frontend", "/var/cache/apt/archives/lock", "/var/lib/dpkg/lock"]:
-        try:
-            os.remove(rFile)
-        except FileNotFoundError:
-            pass
+    # Lock files are never deleted (that corrupts a running apt/unattended-upgrades). Wait for the
+    # holder to finish instead; if none is running, finish any half-configured packages.
+    protectFromAutoRestart()
+    waitForApt()
+    aptRun(["dpkg", "--configure", "-a"])
 
     printc("Updating Operating System")
-    subprocess.run("apt-get update -y > /dev/null 2>&1", shell=True)
-    subprocess.run("apt-get -y full-upgrade > /dev/null 2>&1", shell=True)
+    waitForApt()
+    if aptRun(["apt-get", "update"]) != 0:
+        printc("apt-get update reported an error (see %s)" % rAptLog, col.BRIGHT_YELLOW)
+    waitForApt()
+    if aptRun(["apt-get", "full-upgrade"]) != 0:
+        printc("System upgrade reported an error, continuing (see %s)" % rAptLog, col.BRIGHT_YELLOW)
 
-    for rPackage in rPackages:
-        if not is_installed(rPackage):
-            printc(f"Installing {rPackage}")
-            subprocess.run(f"apt-get install {rPackage} -y > /dev/null 2>&1", shell=True)
-
-    subprocess.run("apt-get install -f -y > /dev/null 2>&1", shell=True)
+    if not ensurePackages():
+        printc("Installation stopped: a required package is missing. Log: %s" % rAptLog, col.BRIGHT_RED, 1)
+        return False
 
     try:
         subprocess.run("getent passwd xtreamcodes > /dev/null 2>&1", shell=True, check=True)
     except subprocess.CalledProcessError:
         printc("Creating user xtreamcodes")
         subprocess.run("adduser --system --shell /bin/false --group --disabled-login xtreamcodes > /dev/null 2>&1", shell=True)
+    # nscd may have cached a failed lookup; flush it, then verify the user really resolves.
+    os.system("nscd -i passwd > /dev/null 2>&1")
+    ensureNscd()
+    if subprocess.run("getent passwd xtreamcodes > /dev/null 2>&1", shell=True).returncode != 0:
+        printc("User xtreamcodes does not resolve (getent passwd xtreamcodes)", col.BRIGHT_RED)
+        return False
 
     if not os.path.exists("/home/xtreamcodes"):
         os.mkdir("/home/xtreamcodes")
@@ -215,20 +362,55 @@ def install(rType="MAIN"):
     printc("Failed to download installation file!", col.BRIGHT_RED)
     return False
 
-def checkLibs():
-    # Report (do not abort on) shared libraries the bundled PHP binaries cannot resolve.
-    rBase = "/home/xtreamcodes/iptv_xtream_codes"
-    rMissing = []
-    for rBin in [rBase + "/php/sbin/php-fpm", rBase + "/php/bin/php"]:
+def phpLoadedExtensions(rBase=rBaseDir):
+    # .so files php.ini loads (extension= / zend_extension=), resolved in the extension dir.
+    import glob, re
+    rFiles = []
+    try: rIni = open(rBase + "/php/lib/php.ini").read()
+    except OSError: rIni = ""
+    rDirs = glob.glob(rBase + "/php/lib/php/extensions/no-debug-non-zts-*")
+    for rName in re.findall(r"^\s*(?:zend_)?extension\s*=\s*\"?([^\s\";]+)", rIni, re.M):
+        if not rName.endswith(".so"): rName += ".so"
+        if os.path.isabs(rName): rFiles.append(rName); continue
+        for rDir in rDirs:
+            if os.path.exists(os.path.join(rDir, rName)): rFiles.append(os.path.join(rDir, rName)); break
+        else: rFiles.append(os.path.join(rDirs[0], rName) if rDirs else rName)
+    return rFiles
+
+def lddMissing(rTargets):
+    # {soname: [files that need it]} for every "not found" line ldd prints.
+    rMissing = {}
+    for rBin in rTargets:
+        if not os.path.exists(rBin): continue
         try:
             rOut = subprocess.run(["ldd", rBin], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, universal_newlines=True).stdout
         except OSError:
             continue
         for rLine in rOut.splitlines():
-            if "not found" in rLine: rMissing.append(rLine.strip())
+            if "not found" in rLine and "=>" in rLine:
+                rMissing.setdefault(rLine.split("=>")[0].strip(), []).append(os.path.basename(rBin))
+    return rMissing
+
+def checkLibs():
+    # Check shared libraries of the bundled PHP, its loaded extensions and ffmpeg/ffprobe (nginx is static).
+    # Known missing libraries are installed by package name and re-checked; anything left is reported
+    # in red, recorded in rErrors, and the step is NOT listed as applied.
+    rBase = rBaseDir
+    rTargets = [rBase + "/php/sbin/php-fpm", rBase + "/php/bin/php", rBase + "/bin/ffmpeg", rBase + "/bin/ffprobe"] + phpLoadedExtensions(rBase)
+    rMissing = lddMissing(rTargets)
     if rMissing:
-        printc("Missing libraries for PHP:", col.BRIGHT_RED)
-        for rLine in sorted(set(rMissing)): printc(rLine, col.BRIGHT_RED)
+        rWanted = sorted(set(rLibPackages[l] for l in rMissing if l in rLibPackages))
+        for rPackage in rWanted:
+            printc("Missing library, installing %s" % rPackage, col.BRIGHT_YELLOW)
+            installPackage(rPackage)
+        if rWanted:
+            os.system("ldconfig > /dev/null 2>&1")
+            rMissing = lddMissing(rTargets)
+    if rMissing:
+        printc("Missing libraries for PHP/ffmpeg:", col.BRIGHT_RED)
+        for rLib in sorted(rMissing):
+            printc("%s (needed by %s)%s" % (rLib, ", ".join(sorted(set(rMissing[rLib]))), "" if rLib in rLibPackages else " - unknown package"), col.BRIGHT_RED)
+        rErrors.append("missing libraries: " + ", ".join(sorted(rMissing)))
     else:
         rApplied.append("library check (ldd)")
 
@@ -503,6 +685,63 @@ def start(first=True):
     else: printc("Restarting GTB mods")
     os.system("/home/xtreamcodes/iptv_xtream_codes/start_services.sh > /dev/null")
 
+def nginxPreflight():
+    # nginx -t as root before starting. Returns (returncode, output); a negative code is a crash by signal.
+    try:
+        rRun = subprocess.run([rBaseDir + "/nginx/sbin/nginx", "-t"], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, universal_newlines=True)
+    except OSError as e:
+        return 127, str(e)
+    return rRun.returncode, rRun.stdout
+
+def procRunning(rName):
+    try: return subprocess.run(["pgrep", "-x", rName], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode == 0
+    except OSError: return False
+
+def httpCode(rPort):
+    try:
+        rOut = subprocess.run(["curl", "-s", "-o", "/dev/null", "-w", "%{http_code}", "--max-time", "5", "http://127.0.0.1:%d/" % rPort], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, universal_newlines=True).stdout.strip()
+    except OSError: return "000"
+    return rOut or "000"
+
+def healthProblems(rWait=30):
+    # Waits up to rWait seconds for nginx, nginx_rtmp, php-fpm and the :8880 / :8080 ports; returns what is still wrong.
+    rProblems = []
+    for rTry in range(max(1, rWait // 3)):
+        rProblems = [rName + " is not running" for rName in ["nginx", "nginx_rtmp", "php-fpm"] if not procRunning(rName)]
+        if not rProblems:
+            rProblems = ["port %d does not answer" % rPort for rPort in [8880, 8080] if httpCode(rPort) == "000"]
+        if not rProblems: break
+        time.sleep(3)
+    return rProblems
+
+def nginxCrashHelp():
+    printc("nginx crashed at start. Most likely cause: the name-service cache (nscd) is not running or the xtreamcodes user lookup failed.", col.BRIGHT_RED)
+    printc("Check: systemctl status nscd; getent passwd xtreamcodes", col.BRIGHT_RED)
+
+def startAndCheck():
+    # Runs start() (unchanged) and verifies the stack really came up. Returns True when healthy.
+    rCode, rOut = nginxPreflight()
+    if rCode != 0:
+        printc("nginx -t failed (exit %d)" % rCode, col.BRIGHT_RED)
+        for rLine in rOut.strip().splitlines()[-6:]: print("    " + rLine)
+        if rCode < 0 or rCode == 139: nginxCrashHelp()
+    start()
+    rProblems = healthProblems()
+    if any(p.startswith("nginx") for p in rProblems):
+        nginxCrashHelp()
+        if pkgInstalled("nscd") and subprocess.run(["systemctl", "is-active", "--quiet", "nscd"]).returncode != 0:
+            printc("nscd is installed but not running: restarting it and starting the panel once more", col.BRIGHT_YELLOW)
+            os.system("systemctl restart nscd > /dev/null 2>&1")
+            os.system("nscd -i passwd > /dev/null 2>&1")
+            start(False)
+            rProblems = healthProblems()
+    if rProblems:
+        for rProblem in rProblems: printc("Health check: " + rProblem, col.BRIGHT_RED)
+        rErrors.append("health check: " + "; ".join(rProblems))
+        return False
+    rApplied.append("health check (nginx, php-fpm, :8880, :8080)")
+    return True
+
 def insertNginxBlock(rPath, rGuard, rBlock):
     # Insert rBlock before the closing brace of http { ... } unless rGuard is already present.
     rPrevData = open(rPath, "r").read()
@@ -705,7 +944,7 @@ if __name__ == "__main__":
             printc("Start installation? Y/N", col.BRIGHT_YELLOW)
             if input("  ").upper() == "Y":
                 print(" ")
-                rRet = prepare(rType.upper())
+                if not prepare(rType.upper()): sys.exit(1)
                 if not install(rType.upper()): sys.exit(1)
                 if not mysql(rUsername, rPassword): sys.exit(1)
                 encrypt(rHost, rUsername, rPassword, rDatabase, rServerID, rPort)
@@ -715,10 +954,16 @@ if __name__ == "__main__":
                 if rCert in ("generated", "fallback"):
                     for rLine in CERT_REMINDER: printc(rLine, col.BRIGHT_YELLOW)
                 finalize()
-                start()
+                startAndCheck()
                 updateGeoLite()
                 printc("Applied: " + ", ".join(rApplied), col.BRIGHT_GREEN)
-                printc("Installation completed!", col.GREEN, 2)
+                if rErrors:
+                    printc("Installation finished with errors", col.BRIGHT_RED, 2)
+                    for rErr in rErrors: printc(rErr, col.BRIGHT_RED)
+                    printc("Next: systemctl status nscd; getent passwd xtreamcodes; ldd php/bin/php; log %s" % rAptLog, col.BRIGHT_RED)
+                    printc("Fix the above, then run /home/xtreamcodes/iptv_xtream_codes/start_services.sh", col.BRIGHT_RED)
+                else:
+                    printc("Installation completed!", col.GREEN, 2)
                 printc("Please store your MySQL password: %s" % rPassword, col.BRIGHT_YELLOW)
                 printc("Admin UI Wan IP: http://%s:8880 (https on 2053)" % getIP(), col.BRIGHT_YELLOW)
                 printc("Admin UI default login is admin/admin", col.BRIGHT_YELLOW)
@@ -730,6 +975,7 @@ if __name__ == "__main__":
                 if rCert in ("generated", "fallback"):
                     rFile.write("\nNOTE: " + " ".join(CERT_REMINDER) + "\n")
                 rFile.close()
+                if rErrors: sys.exit(1)
                 printc("Installation done. It is recommended to REBOOT the server now: reboot", col.BRIGHT_YELLOW)
             else: printc("Installation cancelled", col.BRIGHT_RED)
         else: printc("Invalid entries", col.BRIGHT_RED)
