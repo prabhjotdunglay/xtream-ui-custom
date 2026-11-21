@@ -1019,3 +1019,9 @@ If nginx still segfaults, check `/var/log/gtb-install-apt.log` and run `ldd` on 
 - **"REQUIRED package libcurl4 could not be installed (apt exit 0)"** (commit 8873efc). Ubuntu 24.04 renamed many libraries with a `t64` suffix (64-bit time_t transition, since the 24.04 release): `apt-get install libcurl4` installs `libcurl4t64`. The new `dpkg -s` check looked for the old name only. `pkgInstalled()` now accepts `<name>` or `<name>t64`. Same applies to `libpng16-16` (-> `libpng16-16t64`).
 - Why the old installer "worked": it never verified packages, so the rename was invisible, and so were the real silent failures (mcrypt, GeoIP, nscd) that caused the PHP warnings and the nginx segfault.
 - Tested: py_compile; the wait patterns against sample process lines; `pkgInstalled()` against a mocked dpkg. Not yet confirmed on a full real install.
+
+### 20.x Duplicate movie flush now keeps the NEWEST copy (Nov 2026)
+- Changed on request, to match the SQL used before: `flushDuplicateMovies()` now orders each duplicate group by `id DESC` and keeps the highest id (newest); the older copies are deleted. Everything else is unchanged (bouquets get the kept id before deletion, streams_sys rows and `movies/<id>.*` copies removed, blank names skipped, admin + edit_movie only).
+- Confirm text: "Delete the older copies of duplicate movies? The newest copy is kept."
+- Trade-off: customers' apps that saved an older stream id (favourites, resume points) lose that entry.
+- main_FINAL.zip: 281,088,596 bytes; only admin/functions.php and admin/duplicate_movies.php changed (php -l ok, testzip ok, markers ok). Re-upload to the v1 release.
