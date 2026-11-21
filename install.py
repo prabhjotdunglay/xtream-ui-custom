@@ -159,9 +159,16 @@ def aptBusy():
         if rLocks and subprocess.run(["fuser"] + rLocks, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode == 0:
             return True
     except OSError: pass
-    for rName in ["apt", "apt-get", "dpkg", "unattended-upgr"]:
+    for rName in ["apt", "apt-get", "dpkg"]:
         try:
             if subprocess.run(["pgrep", "-x", rName], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode == 0:
+                return True
+        except OSError: pass
+    # The real upgrader and the daily apt job. Do NOT match "unattended-upgr" by name: the always-running
+    # unattended-upgrade-shutdown daemon has the same process name and would make this wait forever.
+    for rPattern in [r"/usr/bin/unattended-upgrade( |$)", r"apt\.systemd\.daily"]:
+        try:
+            if subprocess.run(["pgrep", "-f", rPattern], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode == 0:
                 return True
         except OSError: pass
     return False
