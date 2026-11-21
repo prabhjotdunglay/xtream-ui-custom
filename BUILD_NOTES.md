@@ -1025,3 +1025,16 @@ If nginx still segfaults, check `/var/log/gtb-install-apt.log` and run `ldd` on 
 - Confirm text: "Delete the older copies of duplicate movies? The newest copy is kept."
 - Trade-off: customers' apps that saved an older stream id (favourites, resume points) lose that entry.
 - main_FINAL.zip: 281,088,596 bytes; only admin/functions.php and admin/duplicate_movies.php changed (php -l ok, testzip ok, markers ok). Re-upload to the v1 release.
+
+## 22. Port standard: streams on HTTP 8080 and HTTPS 443 (MAIN and LB)
+- **Standard:** streams use HTTP 8080 and HTTPS 443 on both MAIN and LB. The panel stays on 8880 (HTTP) and 2053 (HTTPS). The LB also still answers on port 80, so older setups that use 80/443 keep working.
+- **Change 1, panel defaults** (`admin/server.php`, `admin/install_server.php`): the default HTTPS port for new servers changed from 8443 to 443 (both PHP arrays, the HTML value, and the echo fallback). No 8443 remains in `admin/*.php`. No database rows or schema were touched.
+- **Change 2, LB nginx** (`nginx/conf/nginx.conf` inside `sub_FINAL.zip`): added `listen 8080 reuseport;` and `listen [::]:8080 reuseport;` after the port 80 lines. The 80 and 443 lines are unchanged and 80 stays `default_server`.
+- **Checks:** `php -l` on both PHP files, `testzip` on both zips, entry-by-entry compare against the backups (only the intended entries differ), `bash -n install-lb`. `nginx -t` ran only on a minimal temp config with the 80 + 8080 listen block (passed). The full LB config could not be loaded locally (Linux paths, user, modules), so the rest was checked by reading only. Not tested: a real LB, a real nginx run on the server, a MAIN to LB connection.
+- **New sizes:** `main_FINAL.zip` 281,088,596 bytes (same size as before, content changed). `sub_FINAL.zip` 167,330,750 bytes.
+- **New `sub_FINAL.zip` sha256:** `b93e1613ff691eb5a0c44dcc579db5f5ea9de3e636c983082c04339f0ab92523` (in `sub_FINAL.zip.sha256`).
+- **Existing LB already installed:** either
+  - add the two `listen 8080` lines (`listen 8080 reuseport;` and `listen [::]:8080 reuseport;`) to `/home/xtreamcodes/iptv_xtream_codes/nginx/conf/nginx.conf` next to the port 80 lines, then restart with `/home/xtreamcodes/iptv_xtream_codes/start_services.sh`; or
+  - leave the LB as it is and set that server's ports in the panel to 80/443.
+- **Servers already in the panel:** Servers -> Edit -> set HTTP 8080, HTTPS 443.
+- **Release checklist:** re-upload `main_FINAL.zip`, `sub_FINAL.zip` and `sub_FINAL.zip.sha256` to the v1 release. `install-lb` verifies `sub_FINAL.zip` against the `.sha256`, so upload the zip and the hash file together.
