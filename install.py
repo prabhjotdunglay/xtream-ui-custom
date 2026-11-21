@@ -207,10 +207,15 @@ def aptLogTail(rLines=8):
     except OSError: return []
 
 def pkgInstalled(rPackage):
-    try:
-        rOut = subprocess.run(["dpkg", "-s", rPackage], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, universal_newlines=True)
-    except OSError: return False
-    return rOut.returncode == 0 and "Status: install ok installed" in rOut.stdout
+    # Ubuntu 24.04 renamed many libraries with a "t64" suffix (libcurl4 -> libcurl4t64, libpng16-16 -> libpng16-16t64).
+    # apt-get install <old name> installs the new package and exits 0, but dpkg -s <old name> then fails, so
+    # accept either name as "installed".
+    for rName in [rPackage, rPackage + "t64"]:
+        try:
+            rOut = subprocess.run(["dpkg", "-s", rName], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, universal_newlines=True)
+        except OSError: return False
+        if rOut.returncode == 0 and "Status: install ok installed" in rOut.stdout: return True
+    return False
 
 def aptRepair():
     waitForApt()
