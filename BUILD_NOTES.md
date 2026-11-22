@@ -1060,3 +1060,64 @@ If nginx still segfaults, check `/var/log/gtb-install-apt.log` and run `ldd` on 
 - **Prerequisites summary:** fresh Ubuntu 24.04 LB with root SSH password login (`PermitRootLogin yes`, `PasswordAuthentication yes`); main server TCP 7999 reachable from the LB (MariaDB `bind-address = *`, provider firewall and UFW open for the LB IP); `install-lb` and the release assets available on GitHub (`main` branch and release v1).
 - **Test limits:** only a mock paramiko SSH server and a PATH-shim dry run were used. No real Ubuntu server run was done.
 - **New main_FINAL.zip:** 281,094,341 bytes (`ls -l`, 21 Nov 07:19). **Reminder: re-upload main_FINAL.zip to the GitHub release v1**, otherwise new MAIN installs get the old panel without this feature.
+
+
+## 24. In-panel updater (Settings > "Installed Version GTB v8")
+
+The Settings page has an update block next to the installed version. An admin checks GitHub, reads the changelog, clicks Update, and the panel swaps in new code, tests itself and rolls back by itself if the test fails. Nothing runs automatically; every step needs an admin click. The user decided against signed releases (a GitHub account takeover is judged unlikely). The download is still checked with SHA-256.
+
+### How it works
+- **Files:** `admin/gtb_update_api.php` (web side: check, start, status, rollback, channel), `crons/gtb_update.php` (CLI worker), `admin/gtb_health.php` (health endpoint), the block in `admin/settings.php`, and `scripts/build_update_code.py` (runs on the Mac, in the repo).
+- **Web side:** POST only, admin session, permission `adv` + `settings`, per-session CSRF token. It only writes a job file (mode 0600, under `adtools/gtb_update/`, not web-reachable) and starts the worker in the background as the panel user (nohup, like `balancer.py`). A job file younger than 60 s blocks a second queueing.
+- **Worker steps:** 1 check (GitHub releases list, 15 s timeout, drafts ignored, pre-releases only on the test channel, highest release that has all three assets and a valid `version.json`; result cached 10 min, a button click at most once per minute); 2 download `update_code.zip` into `adtools/gtb_update/staging/` (needs 3x the zip size free, 200 MB cap); 3 verify SHA-256 against `update_code.zip.sha256` and `version.json` (they must agree); 4 validate the archive; 5 `php -l` on every changed PHP file plus a critical-file check; 6 backup; 7 swap; 8 activate; 9 self-test; 10 roll back on failure.
+- **State:** `adtools/gtb_update/` holds `job.json`, `progress.json` (polled by the page every few seconds), `state.json`, the lock, `installed_manifest.json`, `staging/` and `backups/`. Log: `logs/gtb_update.log` (no secrets; it is not rotated, delete it now and then). Settings keys in `admin_settings`: `gtb_update_channel`, `gtb_update_last_check`, `gtb_update_last_result`, `gtb_update_installed_version`, `gtb_update_migrations`.
+- **One run at a time:** `flock` on a lock file. A lock older than 60 minutes may be taken over. Known limit: if a live worker hangs for more than 60 minutes, a new run can start while it is still alive. Check `ps` for `gtb_update.php` before starting after a very long stall.
+
+### Release format (three assets on one GitHub release)
+- `update_code.zip`: panel code plus `manifest.json` (every file with sha256 and size), optional `migrations/NNN_name.sql`. About 70 MB today (5,976 entries), mostly PNG files in `wwwdir/c` and `admin/assets`, kept so every update is a full code snapshot. Cap is 200 MB.
+- `update_code.zip.sha256`: 64 hex characters and a newline.
+- `version.json`: `version` (integer), `name`, `changelog`, `min_version`, `requires_manual`, `manual_notes`, `sha256`, `size`, `published`.
+- A GitHub release flagged **pre-release** is a test release. Only panels set to "Include test releases" see it. Tag and asset names must match a strict pattern. Only these hosts over https are used: api.github.com, github.com, objects.githubusercontent.com, release-assets.githubusercontent.com (at most 5 redirects, TLS always verified; falls back to `/etc/ssl/certs/ca-certificates.crt` if the bundled PHP CA bundle fails).
+
+### Preserve / exclude rules (same in the worker and the build script)
+- **Shipped top-level directories only:** `admin`, `wwwdir`, `crons`, `tools`, `pytools`, `SecTools`, `isp`. Root files: `BUILD_NOTES.md`, `database.sql`.
+- **Never shipped, never overwritten, never deleted:** `bin/`, `php/`, `nginx/`, `nginx_rtmp/`, `config`, `adtools/`, `logs/`, `tmp/`, `streams/`, `movies/`, `created_channels/`, `delay/`, `signals/`, `backups/`, `install.py` (all outside the allow-list), and inside the allowed directories: `isp/data/`, `admin/icons/`, `isp/errors.txt`, `isp/cloud_ips`, `isp/apibackup.txt`, any `GeoLite2.mmdb`, `maxmind.key`, any file starting `cloud_ssl`, `.DS_Store`, `Thumbs.db`, `*.pyc`, `*.bak` (including `*.obf.bak`), `__pycache__`, `.git`, `.agents`.
+- **Archive rejects:** absolute paths, `..`, backslashes, colons, symlinks, odd characters, names containing `.gtbtmp`, anything outside the allow-list, a file missing from or different from `manifest.json`, more than 20,000 entries, more than 400 MB unpacked, a single file over 100 MB. The package is never executed; only `php -l` runs on it.
+- **Deletes:** a file is removed only if the previous manifest listed it, the new manifest does not, and its hash still matches the old one. Locally modified or unknown files are kept and logged.
+
+### Safety checks and rollback
+- Refuses same-version and downgrades, and refuses if installed version < `min_version`. `requires_manual: true` downloads nothing and shows `manual_notes`.
+- Backup before the swap: gzip tar of every file the update overwrites or deletes, plus the manifest, in `adtools/gtb_update/backups/v<old>_<time>.tar.gz`. The last 3 are kept; the one just made is never pruned. Manual restore: `tar -xzf <backup> -C /home/xtreamcodes/iptv_xtream_codes`.
+- Swap: each file is written to a temp name in its own directory and renamed (atomic per file), support files first, entry pages last. Modes and the executable bit are kept.
+- Activate: the shipped `php.ini` has `opcache.validate_timestamps=1` and `revalidate_freq=2`, so the worker touches the files and waits a few seconds. If a panel has `validate_timestamps=0`, it sends USR2 to the php-fpm masters from `php/etc/*.conf` after checking they run as the same user. It never runs `start_services.sh` (that kills streams).
+- Self-test for up to 30 s: `http://127.0.0.1:8880/gtb_health.php` returns ok, db true and the new version; the login page returns 200 with `id="login_button"`; `http://127.0.0.1:8080/player_api.php` answers below HTTP 500 (skipped and logged if nothing listens). Any failure triggers an automatic restore from the backup, then a re-test, and `gtb_update_last_result` reads "Update failed and was rolled back: <reason>". If the rollback fails too, the log and the page show the manual `tar` command.
+- Manual "Roll back to vN" restores the newest backup with the same tests.
+- **Migrations:** the mechanism exists (ordered `NNN_name.sql`, each applied once, tracked in `gtb_update_migrations`). A `mysqldump` must succeed first (password only in a temporary 0600 defaults file, deleted after); otherwise the update aborts before any change. A failed migration is not auto-restored in the database: the message names the dump file. Updates without migrations make no dump. No migration is shipped yet.
+- `gtb_health.php` needs no login and opens one DB connection per request. Only nginx rate limits throttle it. It returns only ok, version, db and time.
+
+### Prerequisites
+- Outbound HTTPS from the MAIN server to the GitHub hosts above.
+- Ownership: `install.py` leaves the panel directories writable by `xtreamcodes`, and php-fpm runs as `xtreamcodes`, so the worker can write `admin`, `wwwdir`, `crons`, `tools`, `pytools`, `SecTools`, `isp` and `adtools`. **Pause-point decision: none was needed, `install.py` was not changed.** This was found by reading `install.py`; it was not checked on a real server (see below). If a panel has root-owned files in those directories, fix with `chown -R xtreamcodes:xtreamcodes` on the affected directory.
+- Disk: 3x the zip size free on the panel filesystem.
+
+### What was tested and what was NOT
+- **Tested with a mock** (python http.server as fake GitHub, `php -S` serving the real `gtb_health.php`, a temp copy of BASE, macOS PHP 8.2 so PHP 7.4 was only checked by grep for 8-only syntax): 95 checks, 0 failed. Covered: up to date, cache, a package built by `build_update_code.py` applied cleanly, stable vs pre-release channel, drafts and bad tags skipped, wrong checksum, sha256 file vs `version.json` mismatch, zip-slip, absolute, backslash and symlink entries, files outside the allow-list or in the preserve list, PHP syntax error, failed health check with automatic rollback to byte-identical files, DB down, manual rollback, downgrade, same version, `min_version`, `requires_manual`, deletion of unchanged vs modified files, preserved files untouched, concurrent run refused, 3 backups kept, redirect to a foreign host refused, host allow-list, migration with failing dump or unreachable DB aborting first, no secret in log, progress or state, job file permission checks, and API refusals (non-admin, no permission, GET, no session, bad CSRF). The build script gave identical zip bytes on two runs and no excluded paths.
+- **NOT tested (only a real Ubuntu server can confirm):** the real GitHub fetch and the bundled PHP 7.4 cURL/CA bundle; PHP 7.4 execution; the real `functions.php`, session and permission path (the API ran against a stub); the settings page in a browser; starting the worker with nohup from php-fpm; real file ownership; php-fpm picking up new files and the USR2 branch; real MySQL and `mysqldump`; the real login page on 8880 and `player_api.php` on 8080. Run the first update on a test panel with a pre-release.
+
+### How to publish an update
+BASE is `/Users/prabhjotdunglay/Downloads/untitled folder/xtreamcodes/iptv_xtream_codes`.
+1. Change the code in BASE.
+2. Bump `$rGTBVersion` in `admin/functions.php` (for example `"9"`). The build refuses a version that does not match.
+3. Build the assets from the repo folder:
+   `python3 scripts/build_update_code.py "/Users/prabhjotdunglay/Downloads/untitled folder/xtreamcodes/iptv_xtream_codes" 9 /tmp/gtb_v9 --changelog-file changelog.txt --min-version 8`
+   (add `--requires-manual --manual-notes-file notes.txt` if needed). Output: `update_code.zip`, `update_code.zip.sha256`, `version.json` in `/tmp/gtb_v9`.
+4. On GitHub create a release on a new tag (for example `v9`), tick **This is a pre-release**, and upload all three assets.
+5. On a test panel open Settings, choose "Include test releases", click Check, Update, and verify the panel works.
+6. Edit the release and untick pre-release. It is now stable and customers see it.
+7. If binaries, nginx config or the database schema change, build with `--requires-manual` (the panel then only shows the notes) and also upload a fresh `main_FINAL.zip`.
+
+### Fresh installs, first install of the updater
+- Fresh installs still use `main_FINAL.zip` from release v1.
+- **`main_FINAL.zip` must be re-uploaded to the v1 release now** because it contains the updater itself. New size: 281,115,860 bytes.
+- **The first install of the updater has to come from the new `main_FINAL.zip`.** Old panels have no updater and need the manual route (reinstall, or copy the new files by hand).
+- The displayed version stays GTB v8 until you publish v9.
