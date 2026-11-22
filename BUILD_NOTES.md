@@ -1121,3 +1121,21 @@ BASE is `/Users/prabhjotdunglay/Downloads/untitled folder/xtreamcodes/iptv_xtrea
 - **`main_FINAL.zip` must be re-uploaded to the v1 release now** because it contains the updater itself. New size: 281,115,860 bytes.
 - **The first install of the updater has to come from the new `main_FINAL.zip`.** Old panels have no updater and need the manual route (reinstall, or copy the new files by hand).
 - The displayed version stays GTB v8 until you publish v9.
+
+## 25. New GTB ghost logo and favicon set (Odin branding removed)
+- **Source:** the user's `ghost.jpg`. The outer black was removed (flood fill on a cleaned mask, 1px erode, 0.6px feather) so the images are transparent. Thin ghost arm outlines that touch the outside are partly lost, so the white edge is faint on light backgrounds.
+- **Master:** `assets/ghost_master.png` in this repo (812x707 RGBA). Rebuild all derived images from it; do not depend on a Downloads folder.
+- **Replaced** (BASE = `xtreamcodes/iptv_xtream_codes/`, old -> new bytes):
+  - `admin/assets/images/logo.png` and `logo-back.png`: 35018 -> 43494 (666x172)
+  - `alogo-back.png`: 66216 -> 74125 (1025x257)
+  - `logo-sm.png`: 15032 -> 13533 (146x172)
+  - `admin/assets/images/favicon.ico`: 7227 -> 20620 (frames 16, 32, 48, 64, 128)
+  - `admin/favicon.ico` and `wwwdir/favicon.ico`: 15406 -> 20620, same bytes as the file above. These two were Odin leftovers and are now replaced.
+  - Eight Odin/Viking wallpapers (`bg_odin.png`, `bgpro_odin.png`, `bgodin2/3/4.png`, `bgproodin2/3/4.png`), same names, 1920x1080, all 223595 bytes (ghost centred on a dark gradient).
+- **ASK (open):**
+  - The 8 `bg*odin*` wallpapers are not referenced by any PHP/HTML/CSS/JS. They were replaced rather than deleted. Delete them if preferred.
+  - No `apple-touch-icon.png` or `icon.png` is referenced by any page, so none was created.
+  - `wwwdir/client_area` and `wwwdir/c/template` art is Xtream Codes / Stalker / IPTV, not Odin, and was left alone.
+- **Zip:** `main_FINAL.zip` is now 272,991,030 bytes (was 281,115,860). The drop comes from recompressing at default deflate level; content is identical apart from the 15 replaced files. `testzip` passes and all marker checks pass.
+- **Not tested:** the images were not viewed in a real browser or on a live panel.
+- **Reminder:** re-upload `main_FINAL.zip` to the v1 release.
