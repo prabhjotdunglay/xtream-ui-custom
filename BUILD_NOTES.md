@@ -1147,3 +1147,52 @@ BASE is `/Users/prabhjotdunglay/Downloads/untitled folder/xtreamcodes/iptv_xtrea
 - **Removed:** `crons/update.php` (the old third-party "Xtream UI - Panel Update" cron that could run commands fetched from xtream-ui.com when `auto_update` was set; nothing referenced it). New main_FINAL.zip is 272,989,711 bytes (one entry fewer). Existing installs keep the file until deleted by hand (`rm /home/xtreamcodes/iptv_xtream_codes/crons/update.php`).
 - **Known and left as is (documented, not fixed):** `admin/resize.php` (icon thumbnails in the Streams list) needs no login and can be used to make the server fetch a URL; `admin/gtb_health.php` is a tiny status page used only by the in-panel updater's self-test; the code folders are writable by the php user; nginx runs any `.php` placed in `admin/` or `wwwdir/`. A later hardening round could add a PHP allow-list in nginx and a read-only code tree.
 - **Reminder:** re-upload `main_FINAL.zip` to the v1 release.
+
+## 27. File browser (Add Movie / Add Episode) search fixes
+
+Pop-up opened by the "File Browser" button next to Movie Path / URL (also used on Add Episode and the edit pages). Panel PHP is shipped in `main_FINAL.zip` only, not in this repo.
+
+### What the user sees now
+- **Live filter.** Typing in "Search Directory" filters the current folder as you type. Enter no longer submits or breaks the box.
+- **Folders are filtered too**, not only files. The filter resets when you open another folder.
+- **Error messages.** If the LB does not answer, times out or returns an error, the pop-up shows the message instead of an empty list.
+- **Hindi, Punjabi and special names.** Folder and file names with non-Latin scripts, `+`, `%`, `&`, quotes and spaces now open and display correctly (the path is URL-encoded and the listing is read as UTF-8).
+- **Sub-folder search.** Typing 3 or more characters and starting the search looks inside all sub-folders of the current folder, not just the one on screen. Limits:
+  - depth 6 folders
+  - 200 results maximum
+  - 25 seconds maximum (`timeout 25`)
+  - 3-character minimum (100 maximum)
+  - Clicking a result opens its folder or selects the file.
+- **How it runs on an LB.** The panel sends a `find` command through the existing LB `BackgroundCLI` call (`api.php?action=searchdir`, same permission check as `listdir`). The directory and the query are shell-escaped, the query is glob-escaped, and every returned line must start with the folder you searched in. Nothing new is installed on the LB.
+
+### Watch Folder: why a movie may be skipped (from the code, most common first)
+1. No Category (status 3): no folder category, no TMDB genre match, no fallback category.
+2. No Match (status 4): TMDB title below the match percentage, or the year in the file name differs.
+3. Same display name already exists: logged as "added" but points at the old movie.
+4. Path already known (exact `s:<server_id>:<path>` match).
+5. Extension not in the list (default mp4, mkv, avi, mpg, flv; so no m4v, mov, wmv, webm, ts).
+6. Invalid file (status 5): ffprobe over the LB (5 s limit) fails on a cold Drive file.
+7. Scan interval (default 3600 s) or a previous run still alive.
+8. TMDB key empty, or TMDB errors and rate limits.
+9. One LB listing request failed: that sub-folder is silently treated as empty.
+10. Non-Latin names, `+` or `%` in the path (the listing bugs fixed above apply to the pop-up only, see below).
+
+**Tip:** open the **Watch Folder Output** page first. It lists each skipped file with its status (Added, SQL Error, No Category, No Match, Invalid File).
+
+### What was NOT changed
+- The Watch Folder cron (`crons/watch_folder.php`) and its listing code. Items 9 and 10 above can still affect it.
+- The LB payload (`sub_FINAL.zip`). No LB needs updating.
+- Every other panel feature.
+
+### Files changed (inside `main_FINAL.zip`, 8 entries; the other 17294 are byte-identical)
+`functions.php`, `api.php`, `movie.php`, `episode.php`, `movie_info.php`, `episode_info.php`, `created_channel.php`, `watch_add.php` (all under `admin/` or the panel include path as in the zip).
+`functions.php`: optional `$rCurlTimeout = 0` on `SystemAPIRequest` and `sexec2` (default behaves as before), listDir fixes, new `gtbFb*` / `gtbSearch*` helpers.
+
+### Tested / not tested
+- Done: `php -l` clean on all 8 files; zip `testzip` OK, 17302 entries before and after, order and metadata preserved; marker checks pass; BASE files equal the zipped bytes. Code review APPROVED (shell escaping tried with hostile values, permission guard identical to listdir). Coder test scripts are in `.agents/tasks/file-browser-search/tests/`; no stored result file exists.
+- Not done: no real LB, no real Google Drive/rclone, no real browser. The JS is checked statically, not by clicking.
+- Open (ASK): whether the LB has the `C.UTF-8` locale (`locale -a`), needed for case-insensitive search of non-English names; real search speed on a big Drive.
+
+### Zip and release
+New `main_FINAL.zip` size: 272,994,278 bytes (previous 272,989,711).
+**Reminder: re-upload `main_FINAL.zip` to the v1 GitHub release**, or fresh installs and the in-panel updater will still get the old file.
