@@ -1196,3 +1196,9 @@ Pop-up opened by the "File Browser" button next to Movie Path / URL (also used o
 ### Zip and release
 New `main_FINAL.zip` size: 272,994,278 bytes (previous 272,989,711).
 **Reminder: re-upload `main_FINAL.zip` to the v1 GitHub release**, or fresh installs and the in-panel updater will still get the old file.
+
+### 27.x Updater caveat found while planning v9 (not changed yet)
+- The updater deletes a file only if it is in the previous `installed_manifest.json` and missing from the new one. That list is first written after the first successful update, so the FIRST update (v8 to v9) on a fresh install only adds and replaces files; the log says "No previous file list is stored, so no old files will be removed". Removed files then stay on disk until deleted by hand or until the next update (v9 to v10).
+- Example: `crons/update.php` was removed from `main_FINAL.zip` (section 26), but a panel installed earlier keeps it until `rm /home/xtreamcodes/iptv_xtream_codes/crons/update.php` is run.
+- Option (not built, waiting for a decision): make the first update write a baseline list of the installed files before swapping, so deletions also work from v8 to v9.
+- Current release assets to keep on the v1 release: `main_FINAL.zip` (272,994,278 bytes), `sub_FINAL.zip` (167,330,750 bytes) and `sub_FINAL.zip.sha256`.
