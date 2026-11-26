@@ -1257,7 +1257,7 @@ bash relink_plus_movies.sh
 - **Apply on an existing server without a reinstall:** the in-panel updater cannot be used yet (there is no published update release), so copy the files. Run as root on the main server. Panel PHP changes take effect on the next request (if opcache is set to not revalidate, reload php-fpm too); nginx needs the reload at the end.
 ```
 cd /tmp && rm -rf main_new && mkdir main_new
-wget -O main_FINAL.zip <URL of the v1 release main_FINAL.zip>    # or scp it from your PC
+wget -O main_FINAL.zip https://github.com/prabhjotdunglay/xtream-ui-custom/releases/download/v1/main_FINAL.zip   # or scp it from your PC
 unzip -q main_FINAL.zip -d main_new
 S=/tmp/main_new/iptv_xtream_codes
 D=/home/xtreamcodes/iptv_xtream_codes
@@ -1268,3 +1268,39 @@ done
 /home/xtreamcodes/iptv_xtream_codes/nginx/sbin/nginx -t && /home/xtreamcodes/iptv_xtream_codes/nginx/sbin/nginx -s reload
 ```
   The same six files by hand: `cp -p $D/admin/watch_add.php $D/admin/watch_add.php.bak-r31` then `cp $S/admin/watch_add.php $D/admin/watch_add.php`, and likewise for `admin/resize.php`, `admin/user.php`, `admin/user_reseller.php`, `admin/servers.php`, `nginx/conf/nginx.conf`. If `nginx -t` fails, restore nginx.conf from its `.bak-r31-<time>` copy before reloading. Roll back any file by copying its backup over it. If the server's own nginx.conf has local edits, merge only the `limit_req_zone ... zone=icons` line (http context, next to zone `one`) and the `location = /resize.php { ... }` block (inside the admin server blocks, before the generic PHP location) instead of overwriting. Then: open Watch Folder, re-enter the allowed settings on each existing folder and save.
+
+## 32. Community list update (Nov 2026)
+
+Only `admin/settings.php` changed (Community tab feature list, text only). Telegram and Discord buttons, Leak killer line and all other lines are unchanged.
+
+Lines added or changed:
+- Admin pages: "One-click panel updates from Settings: changelog, backup, self-test and automatic rollback (stable and test channels)"
+- Installer (next to the existing "Our own readable LB installer" line, which is kept): "Install Load Balancer from the panel: installs, links and starts a fresh Ubuntu 24.04 LB over SSH"
+- Movies and series: "File browser with live filter, Enter to search and search in sub-folders (also Hindi/Punjabi names and names with + & %)"
+- Movies and series (changed): "Duplicate movies finder and M3U import for movies and episodes; Clear Duplicate Movies keeps the newest copy and keeps it in every bouquet"
+- Movies and series: "Movies with + in the file name (DD+5.1, AAC+) play and probe correctly"
+- Movies and series: "Watch Folder keeps all its settings (extensions, bouquets, switches) when saved"
+
+The user confirmed on a real server that the Update button and Install Load Balancer work.
+
+Checks: `php -l` OK (macOS php); `<div` minus `</div>` difference unchanged (2); no images added; zip testzip OK; only `iptv_xtream_codes/admin/settings.php` differs from the round-31 zip.
+
+- New main_FINAL.zip size: 272,994,899 bytes (was 272,994,610)
+- settings.php size: 174,857 bytes (was 173,849)
+- settings.php sha256 old: `736f59871a43365c46f36751d904f841097ba96fbf7fc781199f602829bd895e`
+- settings.php sha256 new: `66b689f3d34581b19aa40708ce9180dc8f176a67fd9a29a80f03a7fa05716c9f`
+
+### Apply on a running main server (no reinstall)
+settings.php is not among the round-31 files, so it can be applied before or after them; order does not matter.
+```
+# on the Mac
+scp "/Users/prabhjotdunglay/Downloads/untitled folder/xtreamcodes/iptv_xtream_codes/admin/settings.php" root@SERVER:/tmp/r32/
+# on the server
+sha256sum /tmp/r32/settings.php    # must be 66b689f3d34581b19aa40708ce9180dc8f176a67fd9a29a80f03a7fa05716c9f
+D=/home/xtreamcodes/iptv_xtream_codes/admin
+cp -p $D/settings.php $D/settings.php.bak-r32-$(date +%Y%m%d-%H%M%S)
+cp /tmp/r32/settings.php $D/settings.php && chown xtreamcodes:xtreamcodes $D/settings.php
+```
+No restart needed; opcache revalidates. Rollback: copy the `settings.php.bak-r32-*` file back over `settings.php`.
+
+Reminder: re-upload main_FINAL.zip to the v1 release.
