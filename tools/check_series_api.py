@@ -50,5 +50,16 @@ def main():
     percat = collections.Counter(str(x.get("category_id")) for x in s)
     print("sum of per-category counts   :", sum(percat.values()))
     print("categories with 0 series     :", sum(1 for k in cats if k not in percat))
+    # per-category table: compare these numbers with what the player app shows for each category
+    empty_by_cat = collections.Counter(str(x.get("category_id")) for x in s if str(x.get("series_id")) in noep)
+    seen = set(); dupnames = collections.Counter()
+    for x in s:
+        n = (x.get("name") or "").strip().lower()
+        if n in seen: dupnames[str(x.get("category_id"))] += 1
+        seen.add(n)
+    print()
+    print("%-9s %-34s %7s %7s %9s" % ("cat_id", "category", "series", "empty", "dup_name"))
+    for k, v in sorted(percat.items(), key=lambda kv: -kv[1]):
+        print("%-9s %-34s %7d %7d %9d" % (k, (cats.get(k) or "?")[:34], v, empty_by_cat.get(k, 0), dupnames.get(k, 0)))
 
 main()
