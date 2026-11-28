@@ -63,7 +63,7 @@ import sys
 import time
 import unicodedata
 
-VERSION = "2026-11-28-S (--remove-orphans no longer crashes when panel ids come from the DB; apt pymysql hint, normal run also fixes panel file type, fix-containers, fix panel years: releasedate + series year, auto DB connect, integrated cleanup, update-source SQL, mirror-from B, no-drive orphan removal, drive speed check, folder-delay, ctrl-c, progress heartbeat, fast cleanup lookups, include-working, undo-orphans, panel-ids/orphans, cleanup export, remove-links, trial, find-gone, peek, auto-pick, panel-info, decisions)"
+VERSION = "2026-11-29-T (--cleanup has size limits, vod_cleanup.py removed; --remove-orphans no longer crashes when panel ids come from the DB; apt pymysql hint, normal run also fixes panel file type, fix-containers, fix panel years: releasedate + series year, auto DB connect, integrated cleanup, update-source SQL, mirror-from B, no-drive orphan removal, drive speed check, folder-delay, ctrl-c, progress heartbeat, fast cleanup lookups, include-working, undo-orphans, panel-ids/orphans, cleanup export, remove-links, trial, find-gone, peek, auto-pick, panel-info, decisions)"
 
 # ---------------------------------------------------------------------------
 # Panel config reader + DB helper
@@ -1485,7 +1485,7 @@ def cmd_export_cleanup(a):
                 print("  %5d  %s" % (n, t))
     print("-" * 66)
     print("Files in %s:" % a.log_dir)
-    print("  %s   <- the ids (give this to vod_cleanup.py on the MAIN server)" % os.path.basename(idfile))
+    print("  %s   <- the ids of the dead titles (vod_heal.py --cleanup removes them from the panel)" % os.path.basename(idfile))
     print("  %s  <- readable list: id, category, title, old file" % os.path.basename(listfile))
     return 0
 
@@ -1830,6 +1830,15 @@ def fc_apply(conn, fix, log_dir, stamp):
     return changed, undo
 
 
+def cleanup_guard(n_ids, total, max_delete, max_percent):
+    """Size limit for --cleanup --apply (the old vod_cleanup.py had the same two limits).
+    Returns None when the number is fine, otherwise a plain-language reason."""
+    if n_ids > max_delete:
+        return "%d titles is more than --max-delete %d" % (n_ids, max_delete)
+    if total > 0 and 100.0 * n_ids / total > max_percent:
+        return "%d titles is %.1f%% of the %d movies and episodes in the panel (limit --max-percent %.0f%%)" % (
+            n_ids, 100.0 * n_ids / total, total, max_percent)
+    return None
 def fc_total(conn):
     with conn.cursor() as cur:
         cur.execute("SELECT COUNT(*) FROM streams WHERE type IN (2,5)")
@@ -2071,7 +2080,7 @@ def main():
                     help="do not connect to the panel DB automatically (skip auto id/year load and inline DB updates)")
     ap.add_argument("--cleanup", action="store_true",
                     help="after --apply: show dead titles and (with --apply) remove them from the panel DB and "
-                         "delete their links. Replaces the separate vod_cleanup.py + --export-cleanup + --remove-links steps. "
+                         "delete their links (no separate vod_cleanup.py any more). Refuses to remove more than --max-delete / --max-percent unless --force. "
                          "Dry run by default unless --apply is also set.")
     ap.add_argument("--remove-orphans", action="store_true",
                     help="with panel-ids (auto or --panel-ids): remove the DEAD leftover links (dry run unless --apply). Working "
@@ -2119,6 +2128,10 @@ def main():
     ap.add_argument("--max-broken-pct", type=float, default=10.0,
                     help="refuse to apply if more than this %% of links look broken (dead-mount guard)")
     ap.add_argument("--force", action="store_true", help="override the dead-mount guard")
+    ap.add_argument("--max-delete", type=int, default=8000,
+                    help="--cleanup --apply refuses to remove more than this many titles (default 8000)")
+    ap.add_argument("--max-percent", type=float, default=15.0,
+                    help="--cleanup --apply refuses to remove more than this %% of all panel movies+episodes (default 15)")
     ap.add_argument("--limit", type=int, default=0, help="stop after this many links (testing)")
     ap.add_argument("--log-dir", default="/home/xtreamcodes/iptv_xtream_codes/logs/vod_heal")
     ap.add_argument("--undo", metavar="LOGFILE", help="restore links changed by a previous --apply run")
@@ -2797,14 +2810,19 @@ def main():
         all_rows_for_cleanup = rows
         cats = set(a.cleanup_categories.split(","))
         cleanup_ids = []
+        _idx_cl = index_links(a.movies_dir)
         for r in all_rows_for_cleanup:
             if r[0] not in ("UNRESOLVED", "ERROR"):
                 continue
-            why = explain(r[4])
-            if why not in cats:
+            # same rule as --export-cleanup: the reason code must start with the category's prefix
+            # (explain() returns a sentence, which never equals a category name, so it cannot be used here)
+            cat_ = next((c for c, (prefix, _) in CLEANUP_CATEGORIES.items() if (r[4] or "").startswith(prefix)), None)
+            if cat_ not in cats:
                 continue
             mid = re.match(r"^(\d+)\.", os.path.basename(r[1]))
             if mid:
+                if any(os.path.exists(x) for x in _idx_cl.get(mid.group(1), [])):
+                    continue          # a link for this id plays now: never remove it
                 cleanup_ids.append(mid.group(1))
         cleanup_ids = sorted(set(cleanup_ids), key=int)
         print("")
@@ -2817,8 +2835,17 @@ def main():
             with open(cleanup_ids_file, "w") as fh:
                 fh.write(",".join(cleanup_ids) + "\n")
             print("  DB not available. Ids written to: %s" % cleanup_ids_file)
-            print("  Run vod_cleanup.py --ids-file %s on the main DB server." % cleanup_ids_file)
+            print("  Run vod_heal.py --cleanup on a server that can reach the panel database (the main server).")
         else:
+            _g = cleanup_guard(len(cleanup_ids), fc_total(_db_conn), a.max_delete, a.max_percent)
+            if _g and a.apply and not a.force:
+                print("")
+                print("  STOPPED, nothing removed: %s." % _g)
+                print("  This is far more than a normal cleanup. A dead mount or a wrong panel can make many titles look dead.")
+                print("  Check the list (run without --apply), and only if it is really right, add --force.")
+                return 2
+            if _g and not a.force:
+                print("  WARNING: %s. --apply would be refused unless you add --force." % _g)
             mv, ep, sr, bq = db_cleanup_ids(_db_conn, cleanup_ids, cats, stamp, dry_run=not a.apply)
             print("  Movies: %d   Episodes: %d   Series fully removed: %d" % (mv, ep, sr))
             if bq:
