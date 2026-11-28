@@ -1304,3 +1304,17 @@ cp /tmp/r32/settings.php $D/settings.php && chown xtreamcodes:xtreamcodes $D/set
 No restart needed; opcache revalidates. Rollback: copy the `settings.php.bak-r32-*` file back over `settings.php`.
 
 Reminder: re-upload main_FINAL.zip to the v1 release.
+
+## 33. Monthly maintenance routine and the VOD tools (Nov 2026)
+- **VOD tools now:** `vod_cleanup.py` is deleted. `vod_heal.py` (branch `vod-heal`, version `2026-11-29-T`) runs on each LB and does everything. `--cleanup` was broken before this version (it compared a sentence with a category name, so it never found a title); it now works, never removes a title that still plays, and refuses (unless `--force`) to remove more than `--max-delete 8000` titles or `--max-percent 15` of the panel's movies and episodes. `--remove-orphans` no longer crashes when the ids come from the database (version S). `series_dedupe.py` is in `tools/` on `main` and runs on the main server.
+- **Rules:** every tool is a dry run unless `--apply` is given. Read the dry run first. Take a database backup before any `--apply` that touches the database. Never run `--cleanup` on one LB without checking the other LB (a movie on both LBs can look dead on one). Do not use `--force`, `--include-working`, `--mirror-from` or `--remove-links` without asking.
+- **Monthly routine (about 30 to 45 minutes):**
+  1. Main server health: `df -h`, `ps aux --sort=-%cpu | head -5`, Servers page all online, `ls /home/xtreamcodes/iptv_xtream_codes/admin/*.php` new files check: `find /home/xtreamcodes/iptv_xtream_codes/admin /home/xtreamcodes/iptv_xtream_codes/wwwdir -name '*.php' -newermt '-35 days'`, last backup exists and is not tiny.
+  2. Database backup: `mysqldump xtream_iptvpro streams streams_sys series series_episodes bouquets > /root/monthly_$(date +%Y%m%d).sql`.
+  3. Panel data checks (read-only SQL): movies in no bouquet, series in no bouquet, `series_dedupe.py` dry run (expect 0 groups).
+  4. Each LB: rclone cache (`vfs-cache-max-size`, count of "cache out of space" lines), certificate expiry, `find .../movies -maxdepth 1 -xtype l | wc -l`.
+  5. Each LB: `vod_heal.py` dry run, read the "Broken" numbers, then `--apply` only if repairs are listed; then `--remove-orphans` dry run and `--apply`.
+  6. Press Start on repaired titles in batches of about 20; check the Movies list filter "Down".
+  7. Only if dead titles remain after `--review`: `vod_heal.py --cleanup` dry run on both LBs, compare, backup, then `--apply`.
+  8. Housekeeping: delete `*.bak-*` files older than a month, check for a new panel release in Settings, `apt` updates only in a quiet hour.
+- **Tested:** the size limit, the plays-now rule, the dry run and apply paths of `vod_heal.py` were tested on a fake movies tree with a mocked database (Mac). Not tested on a real LB: the new `--cleanup` against the real database.
