@@ -63,7 +63,7 @@ import sys
 import time
 import unicodedata
 
-VERSION = "2026-11-12-R (apt pymysql hint, normal run also fixes panel file type, fix-containers, fix panel years: releasedate + series year, auto DB connect, integrated cleanup, update-source SQL, mirror-from B, no-drive orphan removal, drive speed check, folder-delay, ctrl-c, progress heartbeat, fast cleanup lookups, include-working, undo-orphans, panel-ids/orphans, cleanup export, remove-links, trial, find-gone, peek, auto-pick, panel-info, decisions)"
+VERSION = "2026-11-28-S (--remove-orphans no longer crashes when panel ids come from the DB; apt pymysql hint, normal run also fixes panel file type, fix-containers, fix panel years: releasedate + series year, auto DB connect, integrated cleanup, update-source SQL, mirror-from B, no-drive orphan removal, drive speed check, folder-delay, ctrl-c, progress heartbeat, fast cleanup lookups, include-working, undo-orphans, panel-ids/orphans, cleanup export, remove-links, trial, find-gone, peek, auto-pick, panel-info, decisions)"
 
 # ---------------------------------------------------------------------------
 # Panel config reader + DB helper
@@ -1667,6 +1667,15 @@ def mirror_scan(a, healer, mirror, panel_ids):
     return compared, same + alive, broken, healthy, [], mirror_new, info
 
 
+def _ids_age_days(a):
+    """Age of the --panel-ids file in days. When the ids were loaded straight from the database
+    (no --panel-ids file) they are fresh, so the age is 0."""
+    if not getattr(a, "panel_ids", None):
+        return 0.0
+    try:
+        return (time.time() - os.path.getmtime(a.panel_ids)) / 86400.0
+    except OSError:
+        return 0.0
 def remove_orphans_nodrive(a, panel_ids):
     """Leftover links belong to titles that are not in the panel: nobody can reach them, whether or not they
     still point at a file. So removing them does not need the drive at all."""
@@ -1693,7 +1702,7 @@ def remove_orphans_nodrive(a, panel_ids):
         except OSError:
             pass
     tot = real + len(leftovers) + young
-    ids_age = (time.time() - os.path.getmtime(a.panel_ids)) / 86400.0
+    ids_age = _ids_age_days(a)
     print("")
     print("LEFTOVER LINKS (title no longer in the panel), drive not touched:")
     print("  links of real titles (kept) ..... %d" % real)
@@ -2317,7 +2326,7 @@ def main():
         dead = [o for o in old_enough if not o[2]]
         alive_o = [o for o in old_enough if o[2]]
         to_remove = dead + (alive_o if a.include_working else [])
-        ids_age = (time.time() - os.path.getmtime(a.panel_ids)) / 86400.0
+        ids_age = _ids_age_days(a)
         print("")
         print("LEFTOVER LINKS (title no longer in the panel): %d" % len(orphans))
         print("  dead (point at nothing) ......... %d   -> %s" % (len(dead), "will be removed"))
